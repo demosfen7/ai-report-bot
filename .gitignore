@@ -1,0 +1,16 @@
+# Секреты
+.env
+
+# Окружение и кэши Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Сгенерированные файлы (папки оставляем в репозитории через .gitkeep)
+reports/*
+!reports/.gitkeep
+data/json/*
+!data/json/.gitkeep
+logs/

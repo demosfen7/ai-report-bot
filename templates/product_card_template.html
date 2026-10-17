@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Карточка товара</title>
+<style>
+  @page {
+    size: A4;
+    margin: 16mm 18mm 20mm 18mm;
+    @bottom-left {
+      content: "Сгенерировано AI Report Bot · {{ generated_at }}";
+      font-family: "Segoe UI", "Helvetica Neue", Arial, "DejaVu Sans", sans-serif;
+      font-size: 7.5pt;
+      color: #8A93A3;
+    }
+    @bottom-right {
+      content: "Стр. " counter(page) " из " counter(pages);
+      font-family: "Segoe UI", "Helvetica Neue", Arial, "DejaVu Sans", sans-serif;
+      font-size: 7.5pt;
+      color: #8A93A3;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", "Helvetica Neue", Arial, "DejaVu Sans", sans-serif;
+    font-size: 10pt;
+    line-height: 1.5;
+    color: #1B2333;
+  }
+
+  /* Шапка */
+  .doc-header {
+    border-bottom: 2pt solid #1B2333;
+    padding-bottom: 5mm;
+    margin-bottom: 7mm;
+  }
+  .brand {
+    font-size: 7.5pt;
+    font-weight: 700;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: #0E7C6B;
+  }
+  h1 {
+    margin: 2mm 0 4mm;
+    font-size: 21pt;
+    line-height: 1.15;
+    font-weight: 700;
+  }
+  .meta { width: 100%; border-collapse: collapse; }
+  .meta td { padding: 0; vertical-align: top; font-size: 9pt; }
+  .meta .label {
+    display: block;
+    font-size: 7pt;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #8A93A3;
+  }
+  .meta .right { text-align: right; }
+
+  /* Фото + основная информация */
+  .hero { width: 100%; border-collapse: collapse; margin-bottom: 8mm; }
+  .hero td { vertical-align: top; padding: 0; }
+  .photo-cell { width: 72mm; padding-right: 7mm !important; }
+  .photo {
+    width: 72mm;
+    height: 72mm;
+    border: 0.75pt solid #E1E6ED;
+    border-radius: 2mm;
+    background: #FFFFFF;
+    text-align: center;
+    overflow: hidden;
+  }
+  .photo img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+  }
+  .placeholder {
+    background: #F4F6F9;
+    border: 0.75pt dashed #C9D1DC;
+    color: #8A93A3;
+    padding-top: 22mm;
+  }
+  .placeholder svg { width: 16mm; height: 16mm; }
+  .placeholder .caption { margin-top: 3mm; font-size: 8.5pt; }
+
+  .eyebrow {
+    font-size: 7pt;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #5B6577;
+  }
+  .product-name {
+    margin: 1mm 0 4mm;
+    font-size: 16pt;
+    line-height: 1.25;
+    font-weight: 700;
+  }
+  .price-box {
+    display: inline-block;
+    padding: 2.5mm 5mm;
+    background: #0E7C6B;
+    color: #FFFFFF;
+    border-radius: 2mm;
+    font-size: 16pt;
+    font-weight: 700;
+    line-height: 1.2;
+  }
+  .price-box.empty {
+    background: #F4F6F9;
+    color: #5B6577;
+    font-size: 11pt;
+    font-weight: 600;
+  }
+  .description { margin: 5mm 0 0; font-size: 10pt; color: #2E3747; }
+
+  /* Разделы */
+  .section { margin-bottom: 7mm; }
+  h2 {
+    margin: 0 0 3mm;
+    font-size: 12pt;
+    font-weight: 700;
+    break-after: avoid;
+  }
+  h2 .num {
+    display: inline-block;
+    min-width: 8mm;
+    color: #0E7C6B;
+  }
+  .features { margin: 0; padding: 0; list-style: none; }
+  .features li {
+    break-inside: avoid;
+    padding: 2mm 0 2mm 7mm;
+    border-bottom: 0.75pt solid #E1E6ED;
+    position: relative;
+  }
+  .features li:last-child { border-bottom: none; }
+  .features li::before {
+    content: "";
+    position: absolute;
+    left: 0.5mm;
+    top: 3.6mm;
+    width: 2.2mm;
+    height: 2.2mm;
+    border-radius: 0.6mm;
+    background: #0E7C6B;
+  }
+  .muted { color: #8A93A3; font-style: italic; margin: 0; }
+
+  .source {
+    padding: 3.5mm 4.5mm;
+    background: #F4F6F9;
+    border-radius: 2mm;
+    font-size: 9pt;
+  }
+  .source a {
+    color: #1B4FBF;
+    text-decoration: none;
+    word-break: break-all;
+  }
+  .source .origin { color: #5B6577; margin-top: 1mm; }
+</style>
+</head>
+<body>
+  <header class="doc-header">
+    <div class="brand">AI Report Bot</div>
+    <h1>Карточка товара</h1>
+    <table class="meta">
+      <tr>
+        <td>
+          <span class="label">Дата формирования</span>
+          {{ generated_at_long }}
+        </td>
+        <td class="right">
+          <span class="label">Номер документа</span>
+          {{ document_id }}
+        </td>
+      </tr>
+    </table>
+  </header>
+
+  <table class="hero">
+    <tr>
+      <td class="photo-cell">
+        {% if image_src %}
+        <div class="photo"><img src="{{ image_src }}" alt="Фото товара"></div>
+        {% else %}
+        <div class="photo placeholder">
+          <svg viewBox="0 0 24 24" fill="none" stroke="#9AA3B2" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="4" width="18" height="16" rx="2"/>
+            <circle cx="8.5" cy="9.5" r="1.8"/>
+            <path d="M21 16l-5-5-8 9"/>
+          </svg>
+          <div class="caption">Фото товара не предоставлено</div>
+        </div>
+        {% endif %}
+      </td>
+      <td>
+        <div class="eyebrow">Название</div>
+        <div class="product-name">{{ card.product_name }}</div>
+        <div class="eyebrow" style="margin-bottom: 1.5mm;">Цена</div>
+        <div class="price-box{% if card.price is none %} empty{% endif %}">{{ card.price | price(card.currency) }}</div>
+        {% if card.short_description %}
+        <p class="description">{{ card.short_description }}</p>
+        {% endif %}
+      </td>
+    </tr>
+  </table>
+
+  <section class="section">
+    <h2><span class="num">01</span>Ключевые характеристики</h2>
+    {% if card.key_features %}
+    <ul class="features">
+      {% for feature in card.key_features %}
+      <li>{{ feature }}</li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="muted">Характеристики не указаны.</p>
+    {% endif %}
+  </section>
+
+  <section class="section">
+    <h2><span class="num">02</span>Источник</h2>
+    <div class="source">
+      {% if card.source_url %}
+      <a href="{{ card.source_url }}">{{ card.source_url }}</a>
+      {% else %}
+      Ссылка на источник не указана
+      {% endif %}
+      <div class="origin">
+        {% if manual_entry %}Данные введены пользователем вручную и нормализованы AI.{% else %}Данные получены со страницы {{ card.source_url | domain }} и нормализованы AI.{% endif %}
+      </div>
+    </div>
+  </section>
+</body>
+</html>
