@@ -1,0 +1,27 @@
+# ai-report-bot — учебный проект, пользователь vibecoding (rootless Docker).
+# Бот работает через long polling: портов наружу нет, Caddy не нужен.
+services:
+  vibecoding-ai-report-bot:
+    image: ${IMAGE}
+    container_name: vibecoding-ai-report-bot
+    restart: unless-stopped
+    # TELEGRAM_BOT_TOKEN и ANTHROPIC_API_KEY — CI пишет файл из GitHub Secrets
+    env_file: bot.env
+    # Chromium использует /dev/shm; по умолчанию там всего 64 МБ
+    shm_size: "256mb"
+    mem_limit: 1g
+    cpus: 1.0
+    volumes:
+      - reports:/app/reports
+      - json:/app/data/json
+      - logs:/app/logs
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  reports:
+  json:
+  logs:

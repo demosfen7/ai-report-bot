@@ -1,0 +1,153 @@
+name: Test, Build and Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  DEPLOY_DIR: /opt/vibecoding.aithinglab.com/ai-report-bot
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install system libraries for WeasyPrint
+        run: sudo apt-get update && sudo apt-get install -y libpango-1.0-0 libpangoft2-1.0-0 fonts-dejavu-core
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest -q
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # lowercase: GHCR не принимает заглавные буквы в имени образа
+      - name: Resolve image name
+        id: meta
+        run: |
+          echo "image=${REGISTRY}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:latest
+            ${{ steps.meta.outputs.image }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check bot secrets
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::Добавьте секреты TELEGRAM_BOT_TOKEN и ANTHROPIC_API_KEY в Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create deploy directory
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: mkdir -p ${{ env.DEPLOY_DIR }}
+
+      - name: Copy compose file
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          source: deploy/docker-compose.yml
+          target: ${{ env.DEPLOY_DIR }}
+          strip_components: 1
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          IMAGE: ${{ needs.build-and-push.outputs.image }}:${{ github.sha }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-haiku-5-5' }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          envs: IMAGE,GHCR_USER,GHCR_TOKEN,TELEGRAM_BOT_TOKEN,ANTHROPIC_API_KEY,ANTHROPIC_MODEL
+          script: |
+            set -e
+            cd ${{ env.DEPLOY_DIR }}
+
+            echo "IMAGE=$IMAGE" > .env
+            # секреты бота — только для владельца
+            umask 077
+            {
+              echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN"
+              echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"
+              echo "ANTHROPIC_MODEL=$ANTHROPIC_MODEL"
+            } > bot.env
+
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            docker compose pull
+            docker compose up -d
+            docker logout ghcr.io
+            docker image prune -f
+
+            sleep 15
+            docker compose ps
+            docker compose logs --tail 20
+            # бот не должен падать и перезапускаться (например, из-за неверного токена)
+            test "$(docker inspect -f '{{.State.Running}} {{.RestartCount}}' vibecoding-ai-report-bot)" = "true 0"
