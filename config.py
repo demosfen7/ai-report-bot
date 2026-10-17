@@ -19,6 +19,10 @@ DEFAULT_MODEL: str = "claude-haiku-5-5"
 LLM_JSON_RETRIES: int = 2
 # Таймаут HTTP-запросов при scraping и загрузке фото, секунды.
 HTTP_TIMEOUT: float = 15.0
+# Таймаут загрузки страницы в headless-браузере (для сайтов на JavaScript), секунды.
+BROWSER_TIMEOUT: float = 30.0
+# Сколько последних реплик остаётся в истории после сворачивания старых в резюме.
+SUMMARY_KEEP_MESSAGES: int = 6
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -35,6 +39,9 @@ class Settings:
     anthropic_api_key: str
     anthropic_model: str = DEFAULT_MODEL
     log_level: str = "INFO"
+    browser_rendering: bool = True
+    short_memory_messages: int = 10
+    short_memory_summary_after: int = 20
 
 
 def _require_env(name: str) -> str:
@@ -48,13 +55,48 @@ def _require_env(name: str) -> str:
     return value
 
 
+def _get_int(name: str, default: int, minimum: int) -> int:
+    """Прочитать целое число из окружения с проверкой нижней границы."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} должен быть целым числом, сейчас: {raw!r}") from exc
+    if value < minimum:
+        raise ConfigError(f"{name} должен быть не меньше {minimum}, сейчас: {value}")
+    return value
+
+
+def _get_bool(name: str, default: bool) -> bool:
+    """Прочитать флаг из окружения: true/false, 1/0, yes/no."""
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ConfigError(f"{name} должен быть true или false, сейчас: {raw!r}")
+
+
 def load_settings() -> Settings:
     """Собрать настройки из переменных окружения."""
+    summary_after = _get_int("SHORT_MEMORY_SUMMARY_AFTER", 20, minimum=0)
+    if 0 < summary_after <= SUMMARY_KEEP_MESSAGES:
+        raise ConfigError(
+            f"SHORT_MEMORY_SUMMARY_AFTER должен быть больше {SUMMARY_KEEP_MESSAGES} "
+            "(или 0, чтобы выключить резюмирование)"
+        )
     return Settings(
         telegram_bot_token=_require_env("TELEGRAM_BOT_TOKEN"),
         anthropic_api_key=_require_env("ANTHROPIC_API_KEY"),
         anthropic_model=os.getenv("ANTHROPIC_MODEL", "").strip() or DEFAULT_MODEL,
         log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
+        browser_rendering=_get_bool("BROWSER_RENDERING", True),
+        short_memory_messages=_get_int("SHORT_MEMORY_MESSAGES", 10, minimum=2),
+        short_memory_summary_after=summary_after,
     )
 
 

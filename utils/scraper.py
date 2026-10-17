@@ -9,11 +9,13 @@ OpenGraph, микроразметка itemprop и, наконец, заголо�
 from __future__ import annotations
 
 import base64
+import importlib.util
 import ipaddress
 import json
 import logging
 import re
 import socket
+import threading
 from dataclasses import asdict, dataclass, field
 from io import BytesIO
 from typing import Any
@@ -63,6 +65,7 @@ REASON_HINTS: dict[str, str] = {
     "captcha": "сайт показывает капчу или антибот-проверку",
     "javascript": "страница требует JavaScript",
     "unrecognized": "не удалось распознать данные о товаре на странице",
+    "browser_unavailable": "не удалось запустить браузер для страниц с JavaScript",
 }
 
 
@@ -461,21 +464,175 @@ def detect_block_reason(html: bytes | str) -> str:
     return "unrecognized"
 
 
-def scrape_product(url: str, timeout: float = 15.0) -> ScrapedProduct:
-    """Скачать и разобрать страницу товара.
+def _check_parsed(product: ScrapedProduct, html: bytes | str, source: str) -> ScrapedProduct:
+    """Залогировать результат разбора и поднять ScrapingError, если данных мало."""
+    logger.info(
+        "Scraping (%s): title=%s, price=%s, description=%s, features=%d, image=%s",
+        source, bool(product.title), bool(product.price), bool(product.description),
+        len(product.features), bool(product.image_url),
+    )
+    if not product.is_sufficient():
+        reason = detect_block_reason(html)
+        raise ScrapingError(reason, f"Недостаточно данных на странице {product.source_url} ({reason})")
+    return product
+
+
+def scrape_product_static(url: str, timeout: float = 15.0) -> ScrapedProduct:
+    """Скачать страницу обычным HTTP-запросом и разобрать её.
 
     Raises:
         ScrapingError: страница недоступна, заблокирована или данных недостаточно.
     """
     logger.info("Scraping: старт %s", url)
     html, final_url, encoding = fetch_page(url, timeout)
-    product = parse_product_html(html, final_url, encoding)
-    logger.info(
-        "Scraping: title=%s, price=%s, description=%s, features=%d, image=%s",
-        bool(product.title), bool(product.price), bool(product.description),
-        len(product.features), bool(product.image_url),
-    )
-    if not product.is_sufficient():
-        reason = detect_block_reason(html)
-        raise ScrapingError(reason, f"Недостаточно данных на странице {final_url} ({reason})")
-    return product
+    return _check_parsed(parse_product_html(html, final_url, encoding), html, "http")
+
+
+# --------------------------------------------------------------------------- #
+# Рендеринг страниц, которым нужен JavaScript
+# --------------------------------------------------------------------------- #
+
+# Причины, при которых имеет смысл открыть страницу в настоящем браузере:
+# браузер выполняет JavaScript и часто проходит простые проверки по TLS/User-Agent.
+BROWSER_RETRY_REASONS = frozenset({"javascript", "unrecognized", "captcha", "blocked", "rate_limited"})
+# Картинки, шрифты и видео для разбора не нужны — не тратим на них время и трафик.
+_SKIPPED_RESOURCE_TYPES = frozenset({"image", "media", "font"})
+# Chromium тяжёлый: одновременно работает не больше одного браузера,
+# остальные запросы ждут своей очереди до BROWSER_QUEUE_TIMEOUT секунд.
+_BROWSER_SLOTS = threading.BoundedSemaphore(1)
+BROWSER_QUEUE_TIMEOUT = 90.0
+
+
+def should_try_browser(error: ScrapingError) -> bool:
+    """Стоит ли повторить попытку в браузере после неудачи обычного запроса."""
+    return error.reason in BROWSER_RETRY_REASONS and is_browser_available()
+
+
+def is_browser_available() -> bool:
+    """Установлен ли Playwright (сам Chromium проверяется при запуске)."""
+    return importlib.util.find_spec("playwright") is not None
+
+
+def _is_public_url(url: str, cache: dict[str, bool]) -> bool:
+    """Ведёт ли URL на публичный адрес. Результат кэшируется по хосту на время одной загрузки."""
+    parsed = urlparse(url)
+    if parsed.scheme in ("data", "blob", "about"):
+        return True
+    host = parsed.hostname or ""
+    if host not in cache:
+        try:
+            ensure_public_host(url)
+            cache[host] = True
+        except ScrapingError:
+            cache[host] = False
+    return cache[host]
+
+
+def render_page_with_browser(url: str, timeout: float = 30.0) -> tuple[str, str]:
+    """Открыть страницу в headless Chromium и вернуть HTML после выполнения JavaScript.
+
+    Каждый запрос страницы (включая скрипты и XHR) проверяется: обращения к
+    localhost и внутренним сетям блокируются, как и при обычном scraping.
+
+    Returns:
+        HTML страницы и итоговый URL.
+
+    Raises:
+        ScrapingError: Playwright не установлен, браузер не запустился или страница не загрузилась.
+    """
+    try:
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import TimeoutError as PlaywrightTimeout
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise ScrapingError("javascript", "Playwright не установлен") from exc
+
+    ensure_public_host(url)
+    host_cache: dict[str, bool] = {}
+
+    def guard(route: Any) -> None:
+        request = route.request
+        if request.resource_type in _SKIPPED_RESOURCE_TYPES or not _is_public_url(request.url, host_cache):
+            route.abort()
+        else:
+            route.continue_()
+
+    if not _BROWSER_SLOTS.acquire(timeout=BROWSER_QUEUE_TIMEOUT):
+        raise ScrapingError("browser_unavailable", "Браузер занят другими запросами")
+    logger.info("Browser: открываю %s", url)
+    try:
+        with sync_playwright() as playwright:
+            try:
+                browser = playwright.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
+            except PlaywrightError as exc:
+                raise ScrapingError("browser_unavailable", f"Chromium не запустился: {exc}") from exc
+            try:
+                context = browser.new_context(
+                    user_agent=DEFAULT_HEADERS["User-Agent"],
+                    locale="ru-RU",
+                    viewport={"width": 1366, "height": 900},
+                )
+                page = context.new_page()
+                page.route("**/*", guard)
+                response = page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=8000)
+                except PlaywrightTimeout:
+                    logger.debug("Browser: networkidle не дождались, берём что есть")
+                html = page.content()
+                final_url = page.url
+                status = response.status if response else "?"
+            finally:
+                browser.close()
+    except PlaywrightTimeout as exc:
+        raise ScrapingError("network", f"Браузер не дождался загрузки страницы: {exc}") from exc
+    except PlaywrightError as exc:
+        raise ScrapingError("network", f"Ошибка браузера: {exc}") from exc
+    finally:
+        _BROWSER_SLOTS.release()
+
+    logger.info("Browser: %s → HTTP %s, %d символов HTML", final_url, status, len(html))
+    if not _is_public_url(final_url, host_cache):
+        raise ScrapingError("invalid_url", f"Страница перенаправила на внутренний адрес {final_url}")
+    return html, final_url
+
+
+def scrape_product_browser(url: str, timeout: float = 30.0) -> ScrapedProduct:
+    """Открыть страницу в браузере (с JavaScript) и разобрать её.
+
+    Raises:
+        ScrapingError: браузер недоступен, страница не загрузилась или данных недостаточно.
+    """
+    html, final_url = render_page_with_browser(url, timeout)
+    return _check_parsed(parse_product_html(html, final_url), html, "browser")
+
+
+def scrape_product(url: str, timeout: float = 15.0, use_browser: bool = True) -> ScrapedProduct:
+    """Получить данные товара: сначала HTTP-запросом, при необходимости — через браузер.
+
+    Raises:
+        ScrapingError: данные не удалось получить ни одним способом.
+    """
+    try:
+        return scrape_product_static(url, timeout)
+    except ScrapingError as exc:
+        if not (use_browser and should_try_browser(exc)):
+            raise
+        static_error = exc
+        logger.info("Scraping: HTTP не дал данных (%s), пробую браузер", exc.reason)
+    return scrape_with_browser_fallback(url, static_error, timeout * 2)
+
+
+def scrape_with_browser_fallback(url: str, static_error: ScrapingError, timeout: float = 30.0) -> ScrapedProduct:
+    """Попытка через браузер после неудачи обычного запроса.
+
+    Если сам браузер недоступен, поднимается исходная ошибка обычного запроса:
+    для пользователя она информативнее («сайт показывает капчу» и т.п.).
+    """
+    try:
+        return scrape_product_browser(url, timeout)
+    except ScrapingError as exc:
+        if exc.reason == "browser_unavailable":
+            logger.warning("Browser недоступен: %s", exc)
+            raise static_error from exc
+        raise

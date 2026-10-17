@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from utils import scraper
 from utils.scraper import (
     ScrapingError,
     detect_block_reason,
@@ -86,3 +87,40 @@ def test_normalize_input_url_rejects_text() -> None:
     with pytest.raises(ScrapingError) as info:
         normalize_input_url("просто текст без ссылки")
     assert info.value.reason == "invalid_url"
+
+
+def test_browser_fallback_used_for_js_pages(monkeypatch: pytest.MonkeyPatch) -> None:
+    def static(url: str, timeout: float) -> None:
+        raise ScrapingError("javascript", "пустая SPA")
+
+    rendered = parse_product_html(JSONLD_PAGE, "https://shop.test/p/1")
+    monkeypatch.setattr(scraper, "scrape_product_static", static)
+    monkeypatch.setattr(scraper, "is_browser_available", lambda: True)
+    monkeypatch.setattr(scraper, "scrape_product_browser", lambda url, timeout: rendered)
+    assert scraper.scrape_product("https://shop.test/p/1").title == "Чайник Bosch TWK3A011"
+
+
+def test_browser_not_used_for_404(monkeypatch: pytest.MonkeyPatch) -> None:
+    def static(url: str, timeout: float) -> None:
+        raise ScrapingError("http_error", "HTTP 404")
+
+    def browser(url: str, timeout: float) -> None:
+        raise AssertionError("браузер не должен запускаться для 404")
+
+    monkeypatch.setattr(scraper, "scrape_product_static", static)
+    monkeypatch.setattr(scraper, "is_browser_available", lambda: True)
+    monkeypatch.setattr(scraper, "scrape_product_browser", browser)
+    with pytest.raises(ScrapingError) as info:
+        scraper.scrape_product("https://shop.test/p/404")
+    assert info.value.reason == "http_error"
+
+
+def test_unavailable_browser_keeps_original_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    def browser(url: str, timeout: float) -> None:
+        raise ScrapingError("browser_unavailable", "Chromium не установлен")
+
+    monkeypatch.setattr(scraper, "scrape_product_browser", browser)
+    original = ScrapingError("captcha", "капча")
+    with pytest.raises(ScrapingError) as info:
+        scraper.scrape_with_browser_fallback("https://shop.test/p/1", original)
+    assert info.value.reason == "captcha"

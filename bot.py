@@ -35,9 +35,13 @@ from utils.scraper import (
     download_image_as_data_uri,
     ensure_public_host,
     image_bytes_to_data_uri,
+    is_browser_available,
     normalize_input_url,
-    scrape_product,
+    scrape_product_static,
+    scrape_with_browser_fallback,
+    should_try_browser,
 )
+from utils.short_memory import ShortMemory
 from utils.validators import ClientReport, ProductCard, clean_text_list, normalize_url, save_model_json
 
 logger = logging.getLogger("ai_report_bot")
@@ -57,6 +61,10 @@ MIN_DIALOG_CHARS = 50
 MAX_DIALOG_CHARS = 100_000
 MAX_TXT_FILE_BYTES = 1_000_000
 SKIP_WORDS = {"пропустить", "пропуск", "skip", "-", "—", "нет"}
+# Сколько символов исходного диалога запоминать для вопросов после /report.
+MEMORY_DIALOG_CHARS = 8000
+MAX_CHAT_MESSAGE_CHARS = 4000
+TELEGRAM_TEXT_LIMIT = 4096
 
 TEXT_ONLY = filters.TEXT & ~filters.COMMAND
 
@@ -65,14 +73,23 @@ HELP_TEXT = (
     "/report — PDF-отчёт по диалогу с клиентом\n"
     "/product — PDF-карточка товара по ссылке\n"
     "/cancel — отменить текущий сценарий\n"
-    "/help — список команд"
+    "/clear_chat — очистить память диалога\n"
+    "/help — список команд\n\n"
+    "<b>Память</b>\n"
+    "Вне команд со мной можно просто переписываться. Я помню последние сообщения "
+    "и созданные отчёты и карточки: спросите, например, «что клиент хотел по срокам?» "
+    "или «напиши клиенту письмо по итогам». Более старая часть переписки сворачивается "
+    "в краткое резюме. Память хранится в оперативной памяти и очищается при "
+    "перезапуске бота или командой /clear_chat."
 )
 START_TEXT = (
     "Привет! Я <b>AI Report Bot</b>.\n\n"
     "• <b>/report</b> — пришлите транскрибацию разговора с клиентом, "
     "и я соберу PDF-отчёт: клиент, тема, запрос, настроение, следующие шаги.\n"
     "• <b>/product</b> — пришлите ссылку на товар, и я сделаю PDF-карточку. "
-    "Если сайт не отдаёт данные, заполним карточку вручную.\n\n"
+    "Если сайт не отдаёт данные, заполним карточку вручную.\n"
+    "• Просто напишите сообщение — я помню нашу переписку и созданные документы "
+    "и отвечу на вопросы по ним.\n\n"
     "/help — список команд."
 )
 GENERIC_ERROR_TEXT = (
@@ -93,6 +110,50 @@ def _ai(context: ContextTypes.DEFAULT_TYPE) -> AIProcessor:
 def _pdf(context: ContextTypes.DEFAULT_TYPE) -> PDFGenerator:
     """PDF-генератор из общего хранилища приложения."""
     return context.application.bot_data["pdf"]
+
+
+def _memory(context: ContextTypes.DEFAULT_TYPE) -> ShortMemory:
+    """Кратковременная память диалогов из общего хранилища приложения."""
+    return context.application.bot_data["memory"]
+
+
+async def _maybe_summarize(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    """Свернуть старую часть истории в резюме. Ошибки не пробрасываются: ответ уже отправлен."""
+    memory = _memory(context)
+    if not memory.needs_summary(user_id):
+        return
+    batch = memory.messages_to_summarize(user_id)
+    try:
+        summary = await _ai(context).summarize(memory.get_summary(user_id), batch)
+    except Exception:
+        logger.warning("Память: не удалось сделать резюме, попробую позже", exc_info=True)
+        return
+    memory.apply_summary(user_id, summary, len(batch))
+    logger.info("Память: %d реплик пользователя %s свёрнуты в резюме", len(batch), user_id)
+
+
+async def _remember_document(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int, request: str, result: str
+) -> None:
+    """Записать в память созданный документ, чтобы потом обсуждать его в чате."""
+    memory = _memory(context)
+    memory.add_user_message(user_id, request)
+    memory.add_assistant_message(user_id, result)
+    await _maybe_summarize(context, user_id)
+
+
+def _split_text(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
+    """Разбить длинный ответ на части не длиннее лимита Telegram, по абзацам."""
+    parts: list[str] = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        parts.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    if text:
+        parts.append(text)
+    return parts
 
 
 def _is_skip(text: str) -> bool:
@@ -229,10 +290,44 @@ async def unexpected_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def outside_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Сообщение вне сценария — подсказать команды."""
+    """Нетекстовое сообщение вне сценария — подсказать команды."""
     await update.effective_message.reply_text(
-        "Выберите режим: /report — отчёт по диалогу, /product — карточка товара. /help — все команды."
+        "Выберите режим: /report — отчёт по диалогу, /product — карточка товара. "
+        "Или просто напишите вопрос текстом. /help — все команды."
     )
+
+
+async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Свободный чат вне сценариев: ответ Claude с учётом памяти о переписке."""
+    message = update.effective_message
+    user_id = update.effective_user.id
+    text = (message.text or "").strip()[:MAX_CHAT_MESSAGE_CHARS]
+    if not text:
+        return
+    logger.info("Чат: сообщение от %s (%d символов)", user_id, len(text))
+
+    memory = _memory(context)
+    memory.add_user_message(user_id, text)
+    await message.chat.send_action(ChatAction.TYPING)
+    try:
+        answer = await _ai(context).chat(memory.get_history(user_id), memory.get_summary(user_id))
+    except AIProcessingError as exc:
+        memory.discard_last_user_message(user_id)
+        logger.error("Чат: ошибка LLM: %s", exc.detail or exc.user_message)
+        await message.reply_text(exc.user_message)
+        return
+
+    memory.add_assistant_message(user_id, answer)
+    for part in _split_text(answer):
+        await message.reply_text(part)
+    await _maybe_summarize(context, user_id)
+
+
+async def clear_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/clear_chat — очистить историю и резюме этого пользователя. Сценарий не прерывает."""
+    _memory(context).clear(update.effective_user.id)
+    logger.info("Память пользователя %s очищена", update.effective_user.id)
+    await update.effective_message.reply_text("Память диалога очищена.")
 
 
 # --------------------------------------------------------------------------- #
@@ -279,6 +374,16 @@ async def report_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _send_pdf(message, pdf_path, "<b>Готово! Вот ваш отчёт в PDF.</b>")
         await message.reply_text(_report_summary(report), parse_mode=ParseMode.HTML)
         await _delete_quietly(status)
+        excerpt = dialog[:MEMORY_DIALOG_CHARS]
+        if len(dialog) > MEMORY_DIALOG_CHARS:
+            excerpt += "\n[…диалог обрезан]"
+        await _remember_document(
+            context,
+            update.effective_user.id,
+            f"/report — транскрибация диалога с клиентом для отчёта:\n{excerpt}",
+            "Создан PDF «Отчёт по клиентской консультации». Данные отчёта (JSON):\n"
+            + report.model_dump_json(),
+        )
     except AIProcessingError as exc:
         logger.error("/report: ошибка LLM: %s", exc.detail or exc.user_message)
         await _set_status(status, f"{exc.user_message}\n\nПопробовать снова: /report")
@@ -323,7 +428,7 @@ async def product_receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE
     logger.info("/product: получен URL %s", url)
     status = await message.reply_text("Загружаю страницу товара…")
     try:
-        scraped: ScrapedProduct = await asyncio.to_thread(scrape_product, url, config.HTTP_TIMEOUT)
+        scraped: ScrapedProduct = await _scrape(url, status, context)
     except ScrapingError as exc:
         logger.warning("/product: scraping не удался (%s): %s", exc.reason, exc)
         await _delete_quietly(status)
@@ -338,6 +443,7 @@ async def product_receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE
     raw_data.pop("image_url", None)  # фото и источник берём из scraping, а не из ответа модели
     await _build_and_send_product(
         message, context, status,
+        user_id=update.effective_user.id,
         raw_data=raw_data,
         image_url=scraped.image_url,
         image_bytes=None,
@@ -345,6 +451,20 @@ async def product_receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE
         manual_entry=False,
     )
     return ConversationHandler.END
+
+
+async def _scrape(url: str, status: Message, context: ContextTypes.DEFAULT_TYPE) -> ScrapedProduct:
+    """Обычный HTTP-запрос, а если он не дал данных — страница в headless-браузере."""
+    try:
+        return await asyncio.to_thread(scrape_product_static, url, config.HTTP_TIMEOUT)
+    except ScrapingError as exc:
+        if not (context.application.bot_data["browser_enabled"] and should_try_browser(exc)):
+            raise
+        logger.info("/product: HTTP не дал данных (%s), открываю страницу в браузере", exc.reason)
+        await _set_status(status, "Страница собирается JavaScript-ом — открываю её в браузере…")
+        return await asyncio.to_thread(
+            scrape_with_browser_fallback, url, exc, config.BROWSER_TIMEOUT
+        )
 
 
 async def _start_manual_mode(
@@ -429,6 +549,7 @@ async def manual_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     status = await message.reply_text("Нормализую данные и формирую карточку…")
     await _build_and_send_product(
         message, context, status,
+        user_id=update.effective_user.id,
         raw_data={key: value for key, value in manual.items() if key != "source_url"},
         image_url=image_url,
         image_bytes=image_bytes,
@@ -443,6 +564,7 @@ async def _build_and_send_product(
     context: ContextTypes.DEFAULT_TYPE,
     status: Message,
     *,
+    user_id: int,
     raw_data: dict[str, Any],
     image_url: str | None,
     image_bytes: bytes | None,
@@ -471,6 +593,17 @@ async def _build_and_send_product(
         )
         await _send_pdf(message, pdf_path, _product_caption(card, image_failed))
         await _delete_quietly(status)
+        request = (
+            "/product — карточка товара, данные введены вручную"
+            if manual_entry
+            else f"/product — карточка товара по ссылке {source_url}"
+        )
+        await _remember_document(
+            context,
+            user_id,
+            request,
+            "Создан PDF «Карточка товара». Данные карточки (JSON):\n" + card.model_dump_json(),
+        )
     except AIProcessingError as exc:
         logger.error("/product: ошибка LLM: %s", exc.detail or exc.user_message)
         await _set_status(status, f"{exc.user_message}\n\nПопробовать снова: /product")
@@ -505,6 +638,7 @@ async def _post_init(application: Application) -> None:
             BotCommand("report", "PDF-отчёт по диалогу с клиентом"),
             BotCommand("product", "PDF-карточка товара по ссылке"),
             BotCommand("cancel", "Отменить текущий сценарий"),
+            BotCommand("clear_chat", "Очистить память диалога"),
             BotCommand("help", "Список команд"),
         ]
     )
@@ -532,6 +666,18 @@ def build_application(settings: config.Settings) -> Application:
         json_retries=config.LLM_JSON_RETRIES,
     )
     application.bot_data["pdf"] = PDFGenerator(config.TEMPLATES_DIR, config.REPORTS_DIR)
+    application.bot_data["memory"] = ShortMemory(
+        settings.short_memory_messages,
+        settings.short_memory_summary_after,
+        config.SUMMARY_KEEP_MESSAGES,
+    )
+    browser_enabled = settings.browser_rendering and is_browser_available()
+    application.bot_data["browser_enabled"] = browser_enabled
+    if settings.browser_rendering and not browser_enabled:
+        logger.warning(
+            "BROWSER_RENDERING=true, но Playwright не установлен: сайты на JavaScript уйдут в ручной режим"
+        )
+    logger.info("Рендеринг страниц в браузере: %s", "включён" if browser_enabled else "выключен")
 
     conversation = ConversationHandler(
         entry_points=[
@@ -553,6 +699,7 @@ def build_application(settings: config.Settings) -> Application:
             CommandHandler("cancel", cancel),
             CommandHandler("start", start),
             CommandHandler("help", help_command),
+            CommandHandler("clear_chat", clear_chat),
             MessageHandler(~filters.COMMAND, unexpected_input),
         ],
         allow_reentry=True,
@@ -563,6 +710,8 @@ def build_application(settings: config.Settings) -> Application:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(CommandHandler("clear_chat", clear_chat))
+    application.add_handler(MessageHandler(TEXT_ONLY, chat_message))
     application.add_handler(MessageHandler(filters.ALL, outside_conversation))
     application.add_error_handler(error_handler)
     return application
