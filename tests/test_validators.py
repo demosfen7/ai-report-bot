@@ -23,6 +23,9 @@ VALID_REPORT = {
     "main_request": "Ускорить сайт и добавить Apple Pay.",
     "mood": "Заинтересованная",
     "next_steps": ["Отправить КП до пятницы", "Созвон в понедельник"],
+    "true_need": "Боится повторить неудачу с прошлой студией, которая сорвала сроки.",
+    "true_need_signals": ["Прошлая студия сорвала нам сроки на два месяца"],
+    "recommendation": "Показать план с контрольными точками и предложить штраф за срыв сроков.",
 }
 
 VALID_PRODUCT = {
@@ -169,3 +172,14 @@ def test_test_dialogs_fit_in_telegram_message() -> None:
     for dialog in dialogs:
         assert dialog.title and not dialog.text.startswith("#")
         assert len(dialog.text) + 400 < 4096  # плюс заголовок и HTML-разметка сообщения
+
+
+def test_true_need_fields_required_and_signals_limited() -> None:
+    data = {k: v for k, v in VALID_REPORT.items() if k != "recommendation"}
+    with pytest.raises(LLMResponseError, match="recommendation"):
+        parse_llm_json(json.dumps(data), ClientReport)
+
+    signals = ["«первая»", "вторая", "третья", "четвёртая"]
+    report = ClientReport.model_validate(VALID_REPORT | {"true_need_signals": signals})
+    assert report.true_need_signals == ["первая", "вторая", "третья"]
+    assert ClientReport.model_validate({k: v for k, v in VALID_REPORT.items() if k != "true_need_signals"}).true_need_signals == []

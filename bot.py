@@ -312,7 +312,12 @@ def _report_summary(report: ClientReport) -> str:
         lines += [f"{i}. {e(_short(step, 200))}" for i, step in enumerate(report.next_steps[:10], 1)]
     else:
         lines.append("<b>Следующие шаги:</b> не зафиксированы")
-    return "\n".join(lines)
+    lines += [
+        "",
+        f"<b>Истинный запрос:</b> {e(_short(report.true_need, 600))}",
+        f"<b>Рекомендация:</b> {e(_short(report.recommendation, 600))}",
+    ]
+    return _short("\n".join(lines), TELEGRAM_TEXT_LIMIT)
 
 
 def _product_caption(card: ProductCard, image_missing_note: bool) -> str:

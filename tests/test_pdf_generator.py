@@ -33,6 +33,9 @@ def report() -> ClientReport:
         main_request="Ускорить сайт и добавить Apple Pay к декабрю.",
         mood="Заинтересованная, но переживает за сроки",
         next_steps=["Отправить КП до пятницы", "Созвон в понедельник"],
+        true_need="Боится повторить неудачу с прошлой студией, которая сорвала сроки.",
+        true_need_signals=["Прошлая студия сорвала нам сроки на два месяца"],
+        recommendation="Показать план с контрольными точками и предложить штраф за срыв сроков.",
     )
 
 
@@ -134,3 +137,17 @@ def test_format_price(price: float | None, currency: str | None, expected: str) 
 
 def test_format_date_long() -> None:
     assert format_date_long(datetime(2026, 10, 18, 9, 5)) == "18 октября 2026, 09:05"
+
+
+def test_report_html_has_true_need_section(generator: PDFGenerator, report: ClientReport) -> None:
+    html = generator.render_html(
+        "report_template.html",
+        {"report": report, "generated_at": "", "generated_at_long": "", "document_id": "X"},
+    )
+    assert "Истинный запрос и рекомендация" in html
+    assert report.true_need in html and report.recommendation in html
+    assert "«Прошлая студия сорвала нам сроки на два месяца»" in html
+
+
+def test_report_without_signals(generator: PDFGenerator, report: ClientReport) -> None:
+    _assert_pdf(generator.generate_report_pdf(report.model_copy(update={"true_need_signals": []})))

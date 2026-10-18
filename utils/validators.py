@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 MAX_FEATURES = 12
+MAX_SIGNALS = 3
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
 _BULLET_RE = re.compile(r"^\s*(?:[-–—•*·▪✓✔]+|\d+[.)])\s*")
@@ -147,12 +148,25 @@ class ClientReport(_LLMModel):
     main_request: str = Field(min_length=1, max_length=4000)
     mood: str = Field(min_length=1, max_length=300)
     next_steps: list[str]
+    # Психологический разбор: что на самом деле стоит за запросом.
+    true_need: str = Field(min_length=1, max_length=2000)
+    true_need_signals: list[str] = Field(default_factory=list)
+    recommendation: str = Field(min_length=1, max_length=2000)
 
     @field_validator("next_steps", mode="before")
     @classmethod
     def _split_steps(cls, value: Any) -> Any:
         """Принять шаги и строкой, и списком."""
         return clean_text_list(value)
+
+    @field_validator("true_need_signals", mode="before")
+    @classmethod
+    def _limit_signals(cls, value: Any) -> Any:
+        """Не больше трёх реплик-сигналов, кавычки по краям убираем."""
+        cleaned = clean_text_list(value, limit=MAX_SIGNALS)
+        if isinstance(cleaned, list):
+            return [s.strip("«»\"' ") if isinstance(s, str) else s for s in cleaned]
+        return cleaned
 
 
 class ProductCard(_LLMModel):
