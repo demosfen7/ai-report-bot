@@ -12,6 +12,7 @@ import pytest
 from utils.ai_processor import (
     CHAT_REFUSAL,
     CHAT_SYSTEM_PROMPT,
+    REFUSAL_MARKER,
     AIProcessingError,
     AIProcessor,
     OffTopicError,
@@ -125,5 +126,12 @@ def test_off_topic_rejection_is_not_retried() -> None:
 
 
 def test_chat_prompt_restricts_scope() -> None:
-    assert CHAT_REFUSAL in CHAT_SYSTEM_PROMPT
+    assert REFUSAL_MARKER in CHAT_SYSTEM_PROMPT
     assert "перевод" in CHAT_SYSTEM_PROMPT
+
+
+@pytest.mark.parametrize("reply", ["OFF_TOPIC", "OFF_TOPIC.", "Извините, OFF_TOPIC — перевод: Good morning"])
+def test_refusal_marker_becomes_fixed_text(reply: str) -> None:
+    processor, _ = _processor([reply])
+    answer = asyncio.run(processor.chat([Message("user", "Переведи: Доброе утро")]))
+    assert answer == CHAT_REFUSAL
