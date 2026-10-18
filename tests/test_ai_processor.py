@@ -9,7 +9,14 @@ from typing import Any
 
 import pytest
 
-from utils.ai_processor import AIProcessingError, AIProcessor, _to_api_messages
+from utils.ai_processor import (
+    CHAT_REFUSAL,
+    CHAT_SYSTEM_PROMPT,
+    AIProcessingError,
+    AIProcessor,
+    OffTopicError,
+    _to_api_messages,
+)
 from utils.short_memory import Message
 
 VALID_REPORT = json.dumps(
@@ -107,3 +114,16 @@ def test_summarize_includes_previous_summary() -> None:
     assert result == "новое резюме"
     prompt = fake.messages[0][0]["content"]
     assert "старое резюме" in prompt and "Пользователь: вопрос" in prompt
+
+
+def test_off_topic_rejection_is_not_retried() -> None:
+    processor, fake = _processor(['{"error": "not_a_dialog"}'])
+    with pytest.raises(OffTopicError) as info:
+        asyncio.run(processor.generate_client_report("Переведи текст на английский"))
+    assert len(fake.systems) == 1
+    assert "не похоже на диалог" in info.value.user_message
+
+
+def test_chat_prompt_restricts_scope() -> None:
+    assert CHAT_REFUSAL in CHAT_SYSTEM_PROMPT
+    assert "перевод" in CHAT_SYSTEM_PROMPT

@@ -8,18 +8,22 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import random
 import sys
+import warnings
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
-from telegram import BotCommand, Message, Update
+from telegram import BotCommand, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import TelegramError
+from telegram.warnings import PTBUserWarning
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     ApplicationHandlerStop,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
@@ -30,8 +34,29 @@ from telegram.ext import (
 
 import config
 from utils.access import TOKEN_RE, AccessManager, ActivationResult, parse_access_tokens
-from utils.ai_processor import AIProcessingError, AIProcessor
+from utils.ai_processor import AIProcessingError, AIProcessor, OffTopicError
 from utils.concurrency import PerUserUpdateProcessor
+from utils.examples import TestDialog, load_test_dialogs
+from utils.keyboards import (
+    BTN_CANCEL,
+    BTN_CLEAR,
+    BTN_HELP,
+    BTN_PRODUCT,
+    BTN_REPORT,
+    BTN_TEST,
+    CB_LETTER,
+    CB_NEW_PRODUCT,
+    CB_NEW_REPORT,
+    CB_REPORT_TEST,
+    CB_SKIP,
+    MAIN_MENU,
+    TEXT_INPUT,
+    after_product_keyboard,
+    after_report_keyboard,
+    menu_button,
+    skip_keyboard,
+    test_dialog_keyboard,
+)
 from utils.maintenance import delete_old_files
 from utils.pdf_generator import PDFGenerationError, PDFGenerator, format_price
 from utils.scraper import (
@@ -72,38 +97,47 @@ MEMORY_DIALOG_CHARS = 8000
 MAX_CHAT_MESSAGE_CHARS = 4000
 TELEGRAM_TEXT_LIMIT = 4096
 
-TEXT_ONLY = filters.TEXT & ~filters.COMMAND
+LETTER_REQUEST = (
+    "Напиши короткое деловое письмо клиенту по итогам консультации из последнего отчёта: "
+    "поблагодари за разговор, кратко зафиксируй запрос клиента и договорённости, "
+    "перечисли следующие шаги со сроками."
+)
+DIALOG_EXAMPLES_DIR = config.BASE_DIR / "examples"
 
 HELP_TEXT = (
-    "<b>Команды</b>\n"
-    "/report — PDF-отчёт по диалогу с клиентом\n"
-    "/product — PDF-карточка товара по ссылке\n"
-    "/cancel — отменить текущий сценарий\n"
-    "/clear_chat — очистить память диалога\n"
-    "/help — список команд\n\n"
+    "<b>Кнопки меню</b>\n"
+    f"{BTN_REPORT} — PDF-отчёт по диалогу с клиентом\n"
+    f"{BTN_PRODUCT} — PDF-карточка товара по ссылке\n"
+    f"{BTN_TEST} — пример диалога, чтобы попробовать отчёт\n"
+    f"{BTN_CLEAR} — забыть нашу переписку\n"
+    f"{BTN_CANCEL} — прервать текущий сценарий\n\n"
+    "То же самое доступно командами /report, /product, /clear_chat, /cancel, /help.\n\n"
     "<b>Память</b>\n"
-    "Вне команд со мной можно просто переписываться. Я помню последние сообщения "
-    "и созданные отчёты и карточки: спросите, например, «что клиент хотел по срокам?» "
-    "или «напиши клиенту письмо по итогам». Более старая часть переписки сворачивается "
-    "в краткое резюме. Память хранится в оперативной памяти и очищается при "
-    "перезапуске бота или командой /clear_chat."
+    "После отчёта или карточки можно задать вопрос обычным сообщением: "
+    "«что клиент хотел по срокам?», «напиши клиенту письмо по итогам». "
+    "Я помню последние сообщения и созданные документы; старая часть переписки "
+    "сворачивается в краткое резюме. Память очищается кнопкой "
+    f"{BTN_CLEAR} или при перезапуске бота.\n\n"
+    "Я работаю только с отчётами и карточками товаров — посторонние задачи "
+    "(переводы, справки, тексты на свободную тему) не выполняю."
 )
 START_TEXT = (
-    "Привет! Я <b>AI Report Bot</b>.\n\n"
-    "• <b>/report</b> — пришлите транскрибацию разговора с клиентом, "
-    "и я соберу PDF-отчёт: клиент, тема, запрос, настроение, следующие шаги.\n"
-    "• <b>/product</b> — пришлите ссылку на товар, и я сделаю PDF-карточку. "
-    "Если сайт не отдаёт данные, заполним карточку вручную.\n"
-    "• Просто напишите сообщение — я помню нашу переписку и созданные документы "
-    "и отвечу на вопросы по ним.\n\n"
-    "/help — список команд."
+    "Привет! Я <b>AI Report Bot</b> — превращаю разговоры с клиентами и страницы товаров "
+    "в аккуратные PDF.\n\n"
+    f"{BTN_REPORT} — пришлите расшифровку разговора с клиентом, и я соберу отчёт: "
+    "клиент, тема, запрос, настроение, следующие шаги.\n"
+    f"{BTN_PRODUCT} — пришлите ссылку на товар, и я сделаю карточку. "
+    "Если сайт не отдаёт данные, заполним её вручную.\n"
+    f"{BTN_TEST} — готовый пример диалога, чтобы попробовать.\n\n"
+    "После этого можно задавать вопросы по документам обычным сообщением.\n\n"
+    "Кнопки меню — под полем ввода."
 )
 AUTH_PROMPT = (
     "🔒 Бот доступен по приглашению.\n\n"
     "Отправьте токен доступа сообщением или откройте ссылку-приглашение, которую вам прислали."
 )
 GENERIC_ERROR_TEXT = (
-    "Произошла непредвиденная ошибка. Попробуйте ещё раз: /report или /product."
+    "Произошла непредвиденная ошибка. Попробуйте ещё раз — кнопки меню под полем ввода."
 )
 
 
@@ -190,6 +224,33 @@ def _split_text(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
     return parts
 
 
+async def _ack(update: Update) -> None:
+    """Ответить на нажатие inline-кнопки, чтобы у неё пропали «часики»."""
+    if update.callback_query:
+        try:
+            await update.callback_query.answer()
+        except TelegramError as exc:
+            logger.debug("Не удалось ответить на callback: %s", exc)
+
+
+async def _input_text(update: Update) -> str:
+    """Текст ответа пользователя; нажатие «⏭ Пропустить» превращается в «пропустить»."""
+    query = update.callback_query
+    if query:
+        await _ack(update)
+        try:
+            await query.edit_message_reply_markup(None)  # кнопку больше не нажать повторно
+        except TelegramError as exc:
+            logger.debug("Не удалось убрать кнопку: %s", exc)
+        return "пропустить"
+    return (update.effective_message.text or "").strip()
+
+
+def _test_dialogs(context: ContextTypes.DEFAULT_TYPE) -> list[TestDialog]:
+    """Тестовые диалоги, загруженные при старте."""
+    return context.application.bot_data["test_dialogs"]
+
+
 def _is_skip(text: str) -> bool:
     """Пользователь хочет пропустить необязательный шаг."""
     return text.strip().lower().strip(".!") in SKIP_WORDS
@@ -220,15 +281,18 @@ async def _delete_quietly(message: Message | None) -> None:
         logger.debug("Не удалось удалить сообщение: %s", exc)
 
 
-async def _send_pdf(message: Message, path: Path, caption: str) -> None:
+async def _send_pdf(
+    message: Message, path: Path, caption: str, reply_markup: InlineKeyboardMarkup | None = None
+) -> None:
     """Отправить PDF-файл в чат."""
     await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
     with path.open("rb") as file:
-        await message.reply_document(
+        await message.chat.send_document(
             document=file,
             filename=path.name,
             caption=caption,
             parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
         )
     logger.info("PDF отправлен в чат %s: %s", message.chat_id, path.name)
 
@@ -337,7 +401,9 @@ async def access_gate(update: object, context: ContextTypes.DEFAULT_TYPE) -> Non
     result = access.activate(user.id, candidate, user.username)
     await _delete_quietly(message)  # токен не должен оставаться в истории чата
     if result is ActivationResult.ACTIVATED:
-        await message.chat.send_message("✅ Доступ открыт.\n\n" + START_TEXT, parse_mode=ParseMode.HTML)
+        await message.chat.send_message(
+            "✅ Доступ открыт.\n\n" + START_TEXT, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU
+        )
     elif result is ActivationResult.TAKEN:
         await message.chat.send_message(
             "Этот токен уже активирован другим аккаунтом. Попросите владельца бота выдать новый."
@@ -357,13 +423,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """/start — приветствие; заодно сбрасывает текущий сценарий."""
     logger.info("/start от пользователя %s", update.effective_user.id if update.effective_user else "?")
     context.user_data.clear()
-    await update.effective_message.reply_text(START_TEXT, parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(START_TEXT, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
     return ConversationHandler.END
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/help — список команд. Текущий сценарий не прерывает."""
-    await update.effective_message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -371,7 +437,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     logger.info("Сценарий отменён пользователем %s", update.effective_user.id if update.effective_user else "?")
     context.user_data.clear()
     await update.effective_message.reply_text(
-        "Действие отменено. Выберите режим: /report или /product."
+        "Действие отменено. Выберите, что сделать, кнопками меню.", reply_markup=MAIN_MENU
     )
     return ConversationHandler.END
 
@@ -379,25 +445,36 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def unexpected_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Неподходящий тип сообщения внутри сценария (стикер, голосовое и т.п.)."""
     await update.effective_message.reply_text(
-        "Я жду текстовое сообщение. Чтобы выйти из сценария, отправьте /cancel."
+        f"Я жду текстовое сообщение. Чтобы выйти из сценария, нажмите «{BTN_CANCEL}»."
     )
 
 
 async def outside_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Нетекстовое сообщение вне сценария — подсказать команды."""
     await update.effective_message.reply_text(
-        "Выберите режим: /report — отчёт по диалогу, /product — карточка товара. "
-        "Или просто напишите вопрос текстом. /help — все команды."
+        "Выберите действие кнопками меню или напишите вопрос по документам текстом.",
+        reply_markup=MAIN_MENU,
     )
 
 
 async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Свободный чат вне сценариев: ответ Claude с учётом памяти о переписке."""
+    text = (update.effective_message.text or "").strip()[:MAX_CHAT_MESSAGE_CHARS]
+    if text:
+        await _chat_reply(update, context, text)
+
+
+async def letter_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Кнопка «✉️ Письмо клиенту» под отчётом: письмо по последнему отчёту из памяти."""
+    await _ack(update)
+    await _chat_reply(update, context, LETTER_REQUEST)
+    return ConversationHandler.END
+
+
+async def _chat_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Ответ Claude на реплику пользователя с учётом памяти."""
     message = update.effective_message
     user_id = update.effective_user.id
-    text = (message.text or "").strip()[:MAX_CHAT_MESSAGE_CHARS]
-    if not text:
-        return
     logger.info("Чат: сообщение от %s (%d символов)", user_id, len(text))
 
     if not await _check_limit(update, context, "chat"):
@@ -423,7 +500,57 @@ async def clear_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """/clear_chat — очистить историю и резюме этого пользователя. Сценарий не прерывает."""
     _memory(context).clear(update.effective_user.id)
     logger.info("Память пользователя %s очищена", update.effective_user.id)
-    await update.effective_message.reply_text("Память диалога очищена.")
+    await update.effective_message.reply_text("🧹 Память диалога очищена.")
+
+
+async def send_test_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «🧪 Тестовый диалог»: прислать пример, который можно скопировать.
+
+    Текущий сценарий не прерывает: если бот ждёт диалог для отчёта, пример
+    можно сразу скопировать и отправить.
+    """
+    dialogs = _test_dialogs(context)
+    if not dialogs:
+        await update.effective_message.reply_text("Тестовые диалоги не найдены.")
+        return
+    last = context.user_data.get("last_test_dialog")
+    choices = [i for i in range(len(dialogs)) if i != last] or [0]
+    index = random.choice(choices)
+    context.user_data["last_test_dialog"] = index
+    dialog = dialogs[index]
+    logger.info("Тестовый диалог №%d для пользователя %s", index, update.effective_user.id)
+    await update.effective_message.reply_text(
+        f"🧪 <b>Тестовый диалог: {html.escape(dialog.title)}</b>\n"
+        f"Скопируйте текст ниже, нажмите «{BTN_REPORT}» и вставьте его — "
+        "или сразу нажмите кнопку под сообщением.\n\n"
+        f"<pre>{html.escape(dialog.text)}</pre>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=test_dialog_keyboard(index),
+    )
+
+
+async def report_from_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Кнопка «📄 Сделать отчёт из этого диалога» под тестовым диалогом."""
+    await _ack(update)
+    dialogs = _test_dialogs(context)
+    try:
+        index = int(update.callback_query.data.split(":", 1)[1])
+        dialog = dialogs[index].text
+    except (IndexError, ValueError):
+        await update.effective_message.reply_text("Этот пример больше недоступен. Нажмите «🧪 Тестовый диалог» ещё раз.")
+        return ConversationHandler.END
+    context.user_data.clear()
+    await _run_report(update, context, dialog)
+    return ConversationHandler.END
+
+
+async def stale_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Нажата inline-кнопка из уже завершённого сценария."""
+    if update.callback_query:
+        try:
+            await update.callback_query.answer("Эта кнопка уже неактуальна", show_alert=False)
+        except TelegramError as exc:
+            logger.debug("Не удалось ответить на callback: %s", exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -433,11 +560,14 @@ async def clear_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def report_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """/report — запросить текст диалога."""
+    await _ack(update)
     context.user_data.clear()
     logger.info("/report: старт сценария (чат %s)", update.effective_chat.id)
     await update.effective_message.reply_text(
         "Отправьте текст диалога с клиентом, и я подготовлю PDF-отчёт.\n\n"
-        "Можно сообщением или .txt-файлом. Для отмены — /cancel."
+        "Можно сообщением или .txt-файлом. Нет диалога под рукой — нажмите "
+        f"«{BTN_TEST}».",
+        reply_markup=MAIN_MENU,
     )
     return REPORT_WAIT_TEXT
 
@@ -459,11 +589,17 @@ async def report_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"Текст слишком длинный ({len(dialog):,} символов). Максимум — {MAX_DIALOG_CHARS:,}.".replace(",", " ")
         )
         return REPORT_WAIT_TEXT
-    if not await _check_limit(update, context, "pdf"):
-        context.user_data.clear()
-        return ConversationHandler.END
+    context.user_data.clear()
+    await _run_report(update, context, dialog)
+    return ConversationHandler.END
 
-    status = await message.reply_text("Анализирую диалог…")
+
+async def _run_report(update: Update, context: ContextTypes.DEFAULT_TYPE, dialog: str) -> None:
+    """Пайплайн отчёта: лимит → Claude → JSON → PDF → отправка → память."""
+    message = update.effective_message
+    if not await _check_limit(update, context, "pdf"):
+        return
+    status = await message.chat.send_message("Анализирую диалог…")
     try:
         await message.chat.send_action(ChatAction.TYPING)
         report = await _ai(context).generate_client_report(dialog)
@@ -471,7 +607,9 @@ async def report_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _set_status(status, "Формирую PDF…")
         pdf_path = await asyncio.to_thread(_pdf(context).generate_report_pdf, report)
         await _send_pdf(message, pdf_path, "<b>Готово! Вот ваш отчёт в PDF.</b>")
-        await message.reply_text(_report_summary(report), parse_mode=ParseMode.HTML)
+        await message.chat.send_message(
+            _report_summary(report), parse_mode=ParseMode.HTML, reply_markup=after_report_keyboard()
+        )
         await _delete_quietly(status)
         excerpt = dialog[:MEMORY_DIALOG_CHARS]
         if len(dialog) > MEMORY_DIALOG_CHARS:
@@ -483,16 +621,16 @@ async def report_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE
             "Создан PDF «Отчёт по клиентской консультации». Данные отчёта (JSON):\n"
             + report.model_dump_json(),
         )
+    except OffTopicError as exc:
+        await _set_status(status, exc.user_message)
     except AIProcessingError as exc:
         logger.error("/report: ошибка LLM: %s", exc.detail or exc.user_message)
-        await _set_status(status, f"{exc.user_message}\n\nПопробовать снова: /report")
+        await _set_status(status, f"{exc.user_message}\n\nПопробовать снова: «{BTN_REPORT}».")
     except PDFGenerationError:
-        await _set_status(status, "Не удалось создать PDF. Попробуйте ещё раз: /report")
+        await _set_status(status, f"Не удалось создать PDF. Попробуйте ещё раз: «{BTN_REPORT}».")
     except Exception:
         logger.exception("/report: непредвиденная ошибка")
         await _set_status(status, GENERIC_ERROR_TEXT)
-    context.user_data.clear()
-    return ConversationHandler.END
 
 
 # --------------------------------------------------------------------------- #
@@ -502,10 +640,11 @@ async def report_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def product_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """/product — запросить ссылку на товар."""
+    await _ack(update)
     context.user_data.clear()
     logger.info("/product: старт сценария (чат %s)", update.effective_chat.id)
     await update.effective_message.reply_text(
-        "Отправьте ссылку на товар, и я создам карточку в PDF.\n\nДля отмены — /cancel."
+        "Отправьте ссылку на товар, и я создам карточку в PDF.", reply_markup=MAIN_MENU
     )
     return PRODUCT_WAIT_URL
 
@@ -578,7 +717,7 @@ async def _start_manual_mode(
     await message.reply_text(
         "Не удалось автоматически получить данные с сайта. Давайте заполним карточку вручную.\n"
         f"Причина: {reason}.\n\n"
-        "Для отмены — /cancel."
+        f"Передумали — нажмите «{BTN_CANCEL}»."
     )
     await message.reply_text("Введите название товара:")
     return MANUAL_NAME
@@ -586,43 +725,45 @@ async def _start_manual_mode(
 
 async def manual_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Ручной режим: название товара (обязательно)."""
-    text = (update.effective_message.text or "").strip()
+    text = await _input_text(update)
     if not text or _is_skip(text):
         await update.effective_message.reply_text("Название обязательно. Введите название товара:")
         return MANUAL_NAME
     context.user_data["manual"]["title"] = text[:300]
-    await update.effective_message.reply_text("Введите краткое описание товара (или напишите «пропустить»):")
+    await update.effective_message.reply_text("Введите краткое описание товара:", reply_markup=skip_keyboard())
     return MANUAL_DESCRIPTION
 
 
 async def manual_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Ручной режим: краткое описание."""
-    text = (update.effective_message.text or "").strip()
+    text = await _input_text(update)
     context.user_data["manual"]["description"] = None if _is_skip(text) else text[:3000]
     await update.effective_message.reply_text(
-        "Введите цену и валюту, например: 1299 EUR:\n(или напишите «пропустить»)"
+        "Введите цену и валюту, например: 1299 EUR:", reply_markup=skip_keyboard()
     )
     return MANUAL_PRICE
 
 
 async def manual_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Ручной режим: цена и валюта одной строкой — нормализует Claude."""
-    text = (update.effective_message.text or "").strip()
+    text = await _input_text(update)
     context.user_data["manual"]["price_and_currency"] = None if _is_skip(text) else text[:100]
     await update.effective_message.reply_text(
         "Введите ключевые характеристики — каждую с новой строки или через «;».\n"
-        "Например:\nОбъём 1,8 л\nМощность 1450 Вт\n\n(или напишите «пропустить»)"
+        "Например:\nОбъём 1,8 л\nМощность 1450 Вт",
+        reply_markup=skip_keyboard(),
     )
     return MANUAL_FEATURES
 
 
 async def manual_features(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Ручной режим: список характеристик."""
-    text = (update.effective_message.text or "").strip()
+    text = await _input_text(update)
     context.user_data["manual"]["features"] = [] if _is_skip(text) else clean_text_list(text, limit=20)
     await update.effective_message.reply_text(
         "Отправьте прямую ссылку на фото товара или напишите “пропустить”.\n"
-        "Можно также просто прислать фото в чат."
+        "Можно также просто прислать фото в чат.",
+        reply_markup=skip_keyboard(),
     )
     return MANUAL_IMAGE
 
@@ -634,7 +775,9 @@ async def manual_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     image_url: str | None = None
     image_bytes: bytes | None = None
 
-    if message.photo:
+    if update.callback_query:
+        await _input_text(update)  # «⏭ Пропустить»: карточка без фото
+    elif message.photo:
         telegram_file = await message.photo[-1].get_file()
         image_bytes = bytes(await telegram_file.download_as_bytearray())
         logger.info("/product: фото получено из чата (%d КБ)", len(image_bytes) // 1024)
@@ -648,7 +791,7 @@ async def manual_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 )
                 return MANUAL_IMAGE
 
-    status = await message.reply_text("Нормализую данные и формирую карточку…")
+    status = await message.chat.send_message("Нормализую данные и формирую карточку…")
     await _build_and_send_product(
         message, context, status,
         user_id=update.effective_user.id,
@@ -693,7 +836,7 @@ async def _build_and_send_product(
         pdf_path = await asyncio.to_thread(
             _pdf(context).generate_product_pdf, card, image_src, manual_entry
         )
-        await _send_pdf(message, pdf_path, _product_caption(card, image_failed))
+        await _send_pdf(message, pdf_path, _product_caption(card, image_failed), after_product_keyboard())
         await _delete_quietly(status)
         request = (
             "/product — карточка товара, данные введены вручную"
@@ -706,11 +849,13 @@ async def _build_and_send_product(
             request,
             "Создан PDF «Карточка товара». Данные карточки (JSON):\n" + card.model_dump_json(),
         )
+    except OffTopicError as exc:
+        await _set_status(status, exc.user_message)
     except AIProcessingError as exc:
         logger.error("/product: ошибка LLM: %s", exc.detail or exc.user_message)
-        await _set_status(status, f"{exc.user_message}\n\nПопробовать снова: /product")
+        await _set_status(status, f"{exc.user_message}\n\nПопробовать снова: «{BTN_PRODUCT}».")
     except PDFGenerationError:
-        await _set_status(status, "Не удалось создать PDF. Попробуйте ещё раз: /product")
+        await _set_status(status, f"Не удалось создать PDF. Попробуйте ещё раз: «{BTN_PRODUCT}».")
     except Exception:
         logger.exception("/product: непредвиденная ошибка")
         await _set_status(status, GENERIC_ERROR_TEXT)
@@ -773,6 +918,11 @@ async def _post_shutdown(application: Application) -> None:
     await application.bot_data["ai"].close()
 
 
+def _skip_button(callback: Any) -> CallbackQueryHandler:
+    """Хендлер inline-кнопки «⏭ Пропустить» для шага ручного ввода."""
+    return CallbackQueryHandler(callback, pattern=f"^{CB_SKIP}$")
+
+
 def build_application(settings: config.Settings) -> Application:
     """Собрать Telegram-приложение со всеми хендлерами.
 
@@ -825,41 +975,63 @@ def build_application(settings: config.Settings) -> Application:
             "BROWSER_RENDERING=true, но Playwright не установлен: сайты на JavaScript уйдут в ручной режим"
         )
     logger.info("Рендеринг страниц в браузере: %s", "включён" if browser_enabled else "выключен")
+    application.bot_data["test_dialogs"] = load_test_dialogs(DIALOG_EXAMPLES_DIR)
+    logger.info("Тестовых диалогов: %d", len(application.bot_data["test_dialogs"]))
 
-    conversation = ConversationHandler(
-        entry_points=[
-            CommandHandler("report", report_start),
-            CommandHandler("product", product_start),
-        ],
-        states={
-            REPORT_WAIT_TEXT: [
-                MessageHandler(TEXT_ONLY | filters.Document.FileExtension("txt"), report_receive_text),
+    # Кнопки и команды, которые работают и внутри сценария, и вне его.
+    common_handlers = [
+        CommandHandler("cancel", cancel),
+        MessageHandler(menu_button(BTN_CANCEL), cancel),
+        CommandHandler("start", start),
+        CommandHandler("help", help_command),
+        MessageHandler(menu_button(BTN_HELP), help_command),
+        CommandHandler("clear_chat", clear_chat),
+        MessageHandler(menu_button(BTN_CLEAR), clear_chat),
+        MessageHandler(menu_button(BTN_TEST), send_test_dialog),
+        CallbackQueryHandler(report_from_test, pattern=f"^{CB_REPORT_TEST}:"),
+        CallbackQueryHandler(letter_button, pattern=f"^{CB_LETTER}$"),
+    ]
+    # PTB предупреждает, что при per_message=False inline-кнопки не привязаны к сообщению.
+    # Нам так и нужно: состояние сценария ведётся по пользователю.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", PTBUserWarning)
+        conversation = ConversationHandler(
+            entry_points=[
+                CommandHandler("report", report_start),
+                MessageHandler(menu_button(BTN_REPORT), report_start),
+                CallbackQueryHandler(report_start, pattern=f"^{CB_NEW_REPORT}$"),
+                CommandHandler("product", product_start),
+                MessageHandler(menu_button(BTN_PRODUCT), product_start),
+                CallbackQueryHandler(product_start, pattern=f"^{CB_NEW_PRODUCT}$"),
             ],
-            PRODUCT_WAIT_URL: [MessageHandler(TEXT_ONLY, product_receive_url)],
-            MANUAL_NAME: [MessageHandler(TEXT_ONLY, manual_name)],
-            MANUAL_DESCRIPTION: [MessageHandler(TEXT_ONLY, manual_description)],
-            MANUAL_PRICE: [MessageHandler(TEXT_ONLY, manual_price)],
-            MANUAL_FEATURES: [MessageHandler(TEXT_ONLY, manual_features)],
-            MANUAL_IMAGE: [MessageHandler(TEXT_ONLY | filters.PHOTO, manual_image)],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CommandHandler("start", start),
-            CommandHandler("help", help_command),
-            CommandHandler("clear_chat", clear_chat),
-            MessageHandler(~filters.COMMAND, unexpected_input),
-        ],
-        allow_reentry=True,
-        name="ai_report_bot",
-    )
+            states={
+                REPORT_WAIT_TEXT: [
+                    MessageHandler(TEXT_INPUT | filters.Document.FileExtension("txt"), report_receive_text),
+                ],
+                PRODUCT_WAIT_URL: [MessageHandler(TEXT_INPUT, product_receive_url)],
+                MANUAL_NAME: [MessageHandler(TEXT_INPUT, manual_name)],
+                MANUAL_DESCRIPTION: [MessageHandler(TEXT_INPUT, manual_description), _skip_button(manual_description)],
+                MANUAL_PRICE: [MessageHandler(TEXT_INPUT, manual_price), _skip_button(manual_price)],
+                MANUAL_FEATURES: [MessageHandler(TEXT_INPUT, manual_features), _skip_button(manual_features)],
+                MANUAL_IMAGE: [
+                    MessageHandler(TEXT_INPUT | filters.PHOTO, manual_image),
+                    _skip_button(manual_image),
+                ],
+            },
+            fallbacks=[
+                *common_handlers,
+                MessageHandler(~filters.COMMAND, unexpected_input),
+            ],
+            allow_reentry=True,
+            name="ai_report_bot",
+        )
 
     application.add_handler(TypeHandler(Update, access_gate), group=-1)
     application.add_handler(conversation)
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("cancel", cancel))
-    application.add_handler(CommandHandler("clear_chat", clear_chat))
-    application.add_handler(MessageHandler(TEXT_ONLY, chat_message))
+    for handler in common_handlers:
+        application.add_handler(handler)
+    application.add_handler(MessageHandler(TEXT_INPUT, chat_message))
+    application.add_handler(CallbackQueryHandler(stale_button))
     application.add_handler(MessageHandler(filters.ALL, outside_conversation))
     application.add_error_handler(error_handler)
     return application

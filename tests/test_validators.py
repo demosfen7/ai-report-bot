@@ -11,6 +11,7 @@ from utils.validators import (
     LLMResponseError,
     ProductCard,
     clean_text_list,
+    extract_rejection,
     parse_llm_json,
     parse_price,
     save_model_json,
@@ -142,3 +143,29 @@ def test_save_model_json_creates_unique_files(tmp_path) -> None:
     second = save_model_json(report, tmp_path, "report")
     assert first != second
     assert json.loads(first.read_text(encoding="utf-8"))["client_name"] == "Анна Ковалёва"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ('{"error": "not_a_dialog"}', "not_a_dialog"),
+        ('```json\n{"error": "not_a_product"}\n```', "not_a_product"),
+        (json.dumps(VALID_REPORT, ensure_ascii=False), None),
+        ('{"error": "x", "client_name": "Анна"}', None),
+        ("не json", None),
+    ],
+)
+def test_extract_rejection(raw: str, expected: str | None) -> None:
+    assert extract_rejection(raw) == expected
+
+
+def test_test_dialogs_fit_in_telegram_message() -> None:
+    from pathlib import Path
+
+    from utils.examples import load_test_dialogs
+
+    dialogs = load_test_dialogs(Path(__file__).resolve().parent.parent / "examples")
+    assert len(dialogs) >= 3
+    for dialog in dialogs:
+        assert dialog.title and not dialog.text.startswith("#")
+        assert len(dialog.text) + 400 < 4096  # плюс заголовок и HTML-разметка сообщения

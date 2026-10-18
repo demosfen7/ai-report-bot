@@ -24,6 +24,7 @@ RUN pip install -r requirements.txt \
 COPY config.py bot.py ./
 COPY utils ./utils
 COPY templates ./templates
+COPY examples ./examples
 
 RUN useradd --create-home --uid 1000 app \
     && mkdir -p data/json data/access reports logs \

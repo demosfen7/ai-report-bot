@@ -215,6 +215,17 @@ def extract_json_text(raw: str) -> str:
     return text
 
 
+def extract_rejection(raw: str) -> str | None:
+    """Код отказа, если модель вернула `{"error": "..."}` вместо данных, иначе None."""
+    try:
+        payload = json.loads(extract_json_text(raw))
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, dict) and set(payload) == {"error"} and isinstance(payload["error"], str):
+        return payload["error"]
+    return None
+
+
 def _format_validation_error(exc: ValidationError) -> str:
     """Сжать ошибки Pydantic в одну строку для лога и уточняющего промпта."""
     parts = []
