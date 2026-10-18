@@ -26,7 +26,7 @@ COPY utils ./utils
 COPY templates ./templates
 
 RUN useradd --create-home --uid 1000 app \
-    && mkdir -p data/json reports logs \
+    && mkdir -p data/json data/access reports logs \
     && chown -R app:app data reports logs
 USER app
 

@@ -83,9 +83,10 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ACCESS_TOKENS: ${{ secrets.ACCESS_TOKENS }}
         run: |
-          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo "::error::Добавьте секреты TELEGRAM_BOT_TOKEN и ANTHROPIC_API_KEY в Settings → Secrets and variables → Actions"
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$ANTHROPIC_API_KEY" ] || [ -z "$ACCESS_TOKENS" ]; then
+            echo "::error::Добавьте секреты TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY и ACCESS_TOKENS в Settings → Secrets and variables → Actions"
             exit 1
           fi
 
@@ -120,13 +121,14 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ACCESS_TOKENS: ${{ secrets.ACCESS_TOKENS }}
           ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-haiku-5-5' }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           port: ${{ secrets.SSH_PORT }}
-          envs: IMAGE,GHCR_USER,GHCR_TOKEN,TELEGRAM_BOT_TOKEN,ANTHROPIC_API_KEY,ANTHROPIC_MODEL
+          envs: IMAGE,GHCR_USER,GHCR_TOKEN,TELEGRAM_BOT_TOKEN,ANTHROPIC_API_KEY,ACCESS_TOKENS,ANTHROPIC_MODEL
           script: |
             set -e
             cd ${{ env.DEPLOY_DIR }}
@@ -137,6 +139,7 @@ jobs:
             {
               echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN"
               echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"
+              echo "ACCESS_TOKENS=$ACCESS_TOKENS"
               echo "ANTHROPIC_MODEL=$ANTHROPIC_MODEL"
             } > bot.env
 

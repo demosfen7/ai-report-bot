@@ -14,20 +14,25 @@ from pathlib import Path
 from typing import Any
 
 from telegram import BotCommand, Message, Update
-from telegram.constants import ChatAction, ParseMode
+from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    ApplicationHandlerStop,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
 import config
+from utils.access import TOKEN_RE, AccessManager, ActivationResult, parse_access_tokens
 from utils.ai_processor import AIProcessingError, AIProcessor
+from utils.concurrency import PerUserUpdateProcessor
+from utils.maintenance import delete_old_files
 from utils.pdf_generator import PDFGenerationError, PDFGenerator, format_price
 from utils.scraper import (
     ScrapingError,
@@ -41,6 +46,7 @@ from utils.scraper import (
     scrape_with_browser_fallback,
     should_try_browser,
 )
+from utils.rate_limit import RateLimiter, format_wait
 from utils.short_memory import ShortMemory
 from utils.validators import ClientReport, ProductCard, clean_text_list, normalize_url, save_model_json
 
@@ -92,6 +98,10 @@ START_TEXT = (
     "и отвечу на вопросы по ним.\n\n"
     "/help — список команд."
 )
+AUTH_PROMPT = (
+    "🔒 Бот доступен по приглашению.\n\n"
+    "Отправьте токен доступа сообщением или откройте ссылку-приглашение, которую вам прислали."
+)
 GENERIC_ERROR_TEXT = (
     "Произошла непредвиденная ошибка. Попробуйте ещё раз: /report или /product."
 )
@@ -115,6 +125,30 @@ def _pdf(context: ContextTypes.DEFAULT_TYPE) -> PDFGenerator:
 def _memory(context: ContextTypes.DEFAULT_TYPE) -> ShortMemory:
     """Кратковременная память диалогов из общего хранилища приложения."""
     return context.application.bot_data["memory"]
+
+
+def _access(context: ContextTypes.DEFAULT_TYPE) -> AccessManager:
+    """Менеджер доступа по токенам."""
+    return context.application.bot_data["access"]
+
+
+def _limiter(context: ContextTypes.DEFAULT_TYPE) -> RateLimiter:
+    """Лимиты частоты запросов."""
+    return context.application.bot_data["limiter"]
+
+
+async def _check_limit(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str) -> bool:
+    """Учесть платное действие; если лимит исчерпан — сообщить пользователю и вернуть False."""
+    limiter = _limiter(context)
+    wait = limiter.hit(update.effective_user.id, kind)
+    if wait is None:
+        return True
+    what = "PDF-документов" if kind == "pdf" else "сообщений в чате"
+    logger.warning("Лимит %s исчерпан пользователем %s", kind, update.effective_user.id)
+    await update.effective_message.reply_text(
+        f"Лимит: не больше {limiter.limit_of(kind)} {what} в час. Попробуйте {format_wait(wait)}."
+    )
+    return False
 
 
 async def _maybe_summarize(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
@@ -255,6 +289,66 @@ async def _read_dialog_text(message: Message) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
+# Доступ
+# --------------------------------------------------------------------------- #
+
+
+async def access_gate(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Пропустить дальше только личные чаты пользователей с действующим токеном.
+
+    Работает в группе хендлеров -1, то есть до всех остальных. Неавторизованный
+    пользователь может только активировать токен: сообщением или ссылкой
+    `t.me/<бот>?start=<токен>`.
+    """
+    if not isinstance(update, Update):
+        raise ApplicationHandlerStop
+    user, chat, message = update.effective_user, update.effective_chat, update.effective_message
+    if user is None or chat is None or user.is_bot:
+        raise ApplicationHandlerStop
+
+    if chat.type != ChatType.PRIVATE:
+        logger.warning("Доступ: апдейт из чата %s (%s) — бот работает только в личке, выхожу", chat.id, chat.type)
+        try:
+            await chat.leave()
+        except TelegramError as exc:
+            logger.debug("Не удалось выйти из чата %s: %s", chat.id, exc)
+        raise ApplicationHandlerStop
+
+    access = _access(context)
+    if access.is_authorized(user.id):
+        return
+    if message is None:
+        raise ApplicationHandlerStop
+
+    candidate = (message.text or "").strip()
+    if candidate.startswith("/start"):
+        candidate = candidate.removeprefix("/start").strip()
+    elif candidate.startswith("/"):
+        candidate = ""
+    if not TOKEN_RE.match(candidate):
+        # обычный текст или команда — не попытка ввести токен
+        await message.reply_text(AUTH_PROMPT)
+        raise ApplicationHandlerStop
+
+    if _limiter(context).hit(user.id, "auth") is not None:
+        logger.warning("Доступ: слишком много попыток ввести токен от %s", user.id)
+        raise ApplicationHandlerStop
+
+    result = access.activate(user.id, candidate, user.username)
+    await _delete_quietly(message)  # токен не должен оставаться в истории чата
+    if result is ActivationResult.ACTIVATED:
+        await message.chat.send_message("✅ Доступ открыт.\n\n" + START_TEXT, parse_mode=ParseMode.HTML)
+    elif result is ActivationResult.TAKEN:
+        await message.chat.send_message(
+            "Этот токен уже активирован другим аккаунтом. Попросите владельца бота выдать новый."
+        )
+    else:
+        logger.info("Доступ: неверный токен от %s", user.id)
+        await message.chat.send_message("Токен не подошёл. Проверьте его и отправьте ещё раз.")
+    raise ApplicationHandlerStop
+
+
+# --------------------------------------------------------------------------- #
 # Общие команды
 # --------------------------------------------------------------------------- #
 
@@ -306,6 +400,8 @@ async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     logger.info("Чат: сообщение от %s (%d символов)", user_id, len(text))
 
+    if not await _check_limit(update, context, "chat"):
+        return
     memory = _memory(context)
     memory.add_user_message(user_id, text)
     await message.chat.send_action(ChatAction.TYPING)
@@ -363,6 +459,9 @@ async def report_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"Текст слишком длинный ({len(dialog):,} символов). Максимум — {MAX_DIALOG_CHARS:,}.".replace(",", " ")
         )
         return REPORT_WAIT_TEXT
+    if not await _check_limit(update, context, "pdf"):
+        context.user_data.clear()
+        return ConversationHandler.END
 
     status = await message.reply_text("Анализирую диалог…")
     try:
@@ -426,6 +525,9 @@ async def product_receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE
         return await _start_manual_mode(message, context, url=url, reason=exc.hint)
 
     logger.info("/product: получен URL %s", url)
+    if not await _check_limit(update, context, "pdf"):
+        context.user_data.clear()
+        return ConversationHandler.END
     status = await message.reply_text("Загружаю страницу товара…")
     try:
         scraped: ScrapedProduct = await _scrape(url, status, context)
@@ -631,8 +733,25 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             logger.warning("Не удалось отправить сообщение об ошибке пользователю")
 
 
+async def _cleanup_loop(application: Application) -> None:
+    """Раз в час: удалить старые PDF и JSON, забыть неактивных пользователей, почистить лимиты."""
+    retention_days = application.bot_data["file_retention_days"]
+    idle_seconds = application.bot_data["memory_idle_hours"] * 3600
+    while True:
+        try:
+            await asyncio.to_thread(delete_old_files, (config.REPORTS_DIR, config.JSON_DIR), retention_days)
+            forgotten = application.bot_data["memory"].prune_idle(idle_seconds)
+            if forgotten:
+                logger.info("Уборка: забыта история %d неактивных пользователей", forgotten)
+            application.bot_data["limiter"].prune()
+        except Exception:
+            logger.exception("Уборка: ошибка")
+        await asyncio.sleep(config.CLEANUP_INTERVAL)
+
+
 async def _post_init(application: Application) -> None:
-    """Зарегистрировать меню команд в Telegram."""
+    """Зарегистрировать меню команд в Telegram и запустить фоновую уборку."""
+    application.bot_data["cleanup_task"] = asyncio.create_task(_cleanup_loop(application))
     await application.bot.set_my_commands(
         [
             BotCommand("report", "PDF-отчёт по диалогу с клиентом"),
@@ -647,15 +766,32 @@ async def _post_init(application: Application) -> None:
 
 
 async def _post_shutdown(application: Application) -> None:
-    """Закрыть соединения клиента Anthropic."""
+    """Остановить уборку и закрыть соединения клиента Anthropic."""
+    task = application.bot_data.get("cleanup_task")
+    if task:
+        task.cancel()
     await application.bot_data["ai"].close()
 
 
 def build_application(settings: config.Settings) -> Application:
-    """Собрать Telegram-приложение со всеми хендлерами."""
+    """Собрать Telegram-приложение со всеми хендлерами.
+
+    Raises:
+        config.ConfigError: ACCESS_TOKENS заданы в неверном формате.
+    """
+    try:
+        tokens = parse_access_tokens(settings.access_tokens)
+    except ValueError as exc:
+        raise config.ConfigError(f"ACCESS_TOKENS: {exc}") from exc
+    if not tokens:
+        raise config.ConfigError("ACCESS_TOKENS: нужен хотя бы один токен")
+
     application = (
         ApplicationBuilder()
         .token(settings.telegram_bot_token)
+        .concurrent_updates(
+            PerUserUpdateProcessor(config.MAX_CONCURRENT_UPDATES, config.MAX_PENDING_PER_USER)
+        )
         .post_init(_post_init)
         .post_shutdown(_post_shutdown)
         .build()
@@ -666,6 +802,17 @@ def build_application(settings: config.Settings) -> Application:
         json_retries=config.LLM_JSON_RETRIES,
     )
     application.bot_data["pdf"] = PDFGenerator(config.TEMPLATES_DIR, config.REPORTS_DIR)
+    application.bot_data["access"] = AccessManager(tokens, config.ACCESS_FILE, config.MAX_USERS_PER_TOKEN)
+    application.bot_data["limiter"] = RateLimiter(
+        {
+            "pdf": (settings.pdf_per_hour, 3600),
+            "chat": (settings.chat_per_hour, 3600),
+            "auth": (config.AUTH_ATTEMPTS_PER_HOUR, 3600),
+        }
+    )
+    application.bot_data["file_retention_days"] = settings.file_retention_days
+    application.bot_data["memory_idle_hours"] = settings.memory_idle_hours
+    logger.info("Доступ: токенов %d (%s)", len(tokens), ", ".join(t.label for t in tokens))
     application.bot_data["memory"] = ShortMemory(
         settings.short_memory_messages,
         settings.short_memory_summary_after,
@@ -706,6 +853,7 @@ def build_application(settings: config.Settings) -> Application:
         name="ai_report_bot",
     )
 
+    application.add_handler(TypeHandler(Update, access_gate), group=-1)
     application.add_handler(conversation)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
@@ -750,7 +898,12 @@ def main() -> None:
     config.ensure_directories()
     setup_logging(settings.log_level)
     logger.info("Запуск AI Report Bot, модель %s", settings.anthropic_model)
-    build_application(settings).run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        application = build_application(settings)
+    except config.ConfigError as exc:
+        logger.error("Ошибка конфигурации: %s", exc)
+        sys.exit(1)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":

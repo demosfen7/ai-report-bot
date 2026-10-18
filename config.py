@@ -13,6 +13,7 @@ TEMPLATES_DIR: Path = BASE_DIR / "templates"
 JSON_DIR: Path = BASE_DIR / "data" / "json"
 REPORTS_DIR: Path = BASE_DIR / "reports"
 LOGS_DIR: Path = BASE_DIR / "logs"
+ACCESS_FILE: Path = BASE_DIR / "data" / "access" / "users.json"
 
 DEFAULT_MODEL: str = "claude-haiku-5-5"
 # Число ПОВТОРНЫХ попыток, если модель вернула невалидный JSON.
@@ -23,6 +24,15 @@ HTTP_TIMEOUT: float = 15.0
 BROWSER_TIMEOUT: float = 30.0
 # Сколько последних реплик остаётся в истории после сворачивания старых в резюме.
 SUMMARY_KEEP_MESSAGES: int = 6
+# Сколько аккаунтов Telegram можно привязать к одному токену доступа.
+MAX_USERS_PER_TOKEN: int = 1
+# Сколько апдейтов обрабатывается параллельно и сколько может ждать у одного пользователя.
+MAX_CONCURRENT_UPDATES: int = 8
+MAX_PENDING_PER_USER: int = 3
+# Неудачных попыток ввести токен в час — дальше бот молчит.
+AUTH_ATTEMPTS_PER_HOUR: int = 5
+# Как часто запускается фоновая уборка, секунды.
+CLEANUP_INTERVAL: float = 3600.0
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -42,12 +52,17 @@ class Settings:
     browser_rendering: bool = True
     short_memory_messages: int = 10
     short_memory_summary_after: int = 20
+    access_tokens: str = ""
+    pdf_per_hour: int = 10
+    chat_per_hour: int = 30
+    file_retention_days: int = 7
+    memory_idle_hours: int = 6
 
 
 def _require_env(name: str) -> str:
     """Вернуть значение обязательной переменной окружения или поднять ConfigError."""
     value = os.getenv(name, "").strip()
-    if not value or value.startswith("your_"):
+    if not value or value.startswith("your_") or ":your_" in value:
         raise ConfigError(
             f"Переменная окружения {name} не задана. "
             f"Скопируйте .env.example в .env и заполните {name}."
@@ -97,10 +112,15 @@ def load_settings() -> Settings:
         browser_rendering=_get_bool("BROWSER_RENDERING", True),
         short_memory_messages=_get_int("SHORT_MEMORY_MESSAGES", 10, minimum=2),
         short_memory_summary_after=summary_after,
+        access_tokens=_require_env("ACCESS_TOKENS"),
+        pdf_per_hour=_get_int("PDF_PER_HOUR", 10, minimum=1),
+        chat_per_hour=_get_int("CHAT_PER_HOUR", 30, minimum=1),
+        file_retention_days=_get_int("FILE_RETENTION_DAYS", 7, minimum=1),
+        memory_idle_hours=_get_int("MEMORY_IDLE_HOURS", 6, minimum=1),
     )
 
 
 def ensure_directories() -> None:
     """Создать папки для JSON, PDF и логов, если их ещё нет."""
-    for directory in (JSON_DIR, REPORTS_DIR, LOGS_DIR):
+    for directory in (JSON_DIR, REPORTS_DIR, LOGS_DIR, ACCESS_FILE.parent):
         directory.mkdir(parents=True, exist_ok=True)

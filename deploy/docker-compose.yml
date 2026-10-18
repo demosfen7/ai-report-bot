@@ -5,7 +5,7 @@ services:
     image: ${IMAGE}
     container_name: vibecoding-ai-report-bot
     restart: unless-stopped
-    # TELEGRAM_BOT_TOKEN и ANTHROPIC_API_KEY — CI пишет файл из GitHub Secrets
+    # TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, ACCESS_TOKENS — CI пишет файл из GitHub Secrets
     env_file: bot.env
     # Chromium использует /dev/shm; по умолчанию там всего 64 МБ
     shm_size: "256mb"
@@ -15,6 +15,8 @@ services:
       - reports:/app/reports
       - json:/app/data/json
       - logs:/app/logs
+      # кто какой токен активировал — должно переживать передеплой
+      - access:/app/data/access
     logging:
       driver: json-file
       options:
@@ -25,3 +27,4 @@ volumes:
   reports:
   json:
   logs:
+  access:
