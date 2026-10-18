@@ -57,12 +57,12 @@ _FEATURE_CONTAINER_RE = re.compile(
 REASON_HINTS: dict[str, str] = {
     "invalid_url": "некорректная ссылка",
     "network": "сайт не отвечает или недоступен",
-    "blocked": "сайт запретил автоматический доступ",
+    "blocked": "сайт защищён от автоматического чтения (антибот-защита)",
     "rate_limited": "сайт ограничил частоту запросов (429)",
     "http_error": "сайт вернул ошибку",
     "not_html": "по ссылке не HTML-страница",
     "too_large": "страница слишком большая",
-    "captcha": "сайт показывает капчу или антибот-проверку",
+    "captcha": "сайт показывает капчу — он защищён от автоматического чтения",
     "javascript": "страница требует JavaScript",
     "unrecognized": "не удалось распознать данные о товаре на странице",
     "browser_unavailable": "не удалось запустить браузер для страниц с JavaScript",
@@ -528,14 +528,14 @@ def _is_public_url(url: str, cache: dict[str, bool]) -> bool:
     return cache[host]
 
 
-def render_page_with_browser(url: str, timeout: float = 30.0) -> tuple[str, str]:
+def render_page_with_browser(url: str, timeout: float = 30.0) -> tuple[str, str, int | None]:
     """Открыть страницу в headless Chromium и вернуть HTML после выполнения JavaScript.
 
     Каждый запрос страницы (включая скрипты и XHR) проверяется: обращения к
     localhost и внутренним сетям блокируются, как и при обычном scraping.
 
     Returns:
-        HTML страницы и итоговый URL.
+        HTML страницы, итоговый URL и HTTP-статус основного документа.
 
     Raises:
         ScrapingError: Playwright не установлен, браузер не запустился или страница не загрузилась.
@@ -581,7 +581,7 @@ def render_page_with_browser(url: str, timeout: float = 30.0) -> tuple[str, str]
                     logger.debug("Browser: networkidle не дождались, берём что есть")
                 html = page.content()
                 final_url = page.url
-                status = response.status if response else "?"
+                status = response.status if response else None
             finally:
                 browser.close()
     except PlaywrightTimeout as exc:
@@ -594,7 +594,7 @@ def render_page_with_browser(url: str, timeout: float = 30.0) -> tuple[str, str]
     logger.info("Browser: %s → HTTP %s, %d символов HTML", final_url, status, len(html))
     if not _is_public_url(final_url, host_cache):
         raise ScrapingError("invalid_url", f"Страница перенаправила на внутренний адрес {final_url}")
-    return html, final_url
+    return html, final_url, status
 
 
 def scrape_product_browser(url: str, timeout: float = 30.0) -> ScrapedProduct:
@@ -603,8 +603,14 @@ def scrape_product_browser(url: str, timeout: float = 30.0) -> ScrapedProduct:
     Raises:
         ScrapingError: браузер недоступен, страница не загрузилась или данных недостаточно.
     """
-    html, final_url = render_page_with_browser(url, timeout)
-    return _check_parsed(parse_product_html(html, final_url), html, "browser")
+    html, final_url, status = render_page_with_browser(url, timeout)
+    try:
+        return _check_parsed(parse_product_html(html, final_url), html, "browser")
+    except ScrapingError as exc:
+        # Сайт ответил браузеру 401/403/429 — это антибот, а не «непонятная разметка».
+        if status in (401, 403, 429) and exc.reason == "unrecognized":
+            raise ScrapingError("blocked", f"HTTP {status} в браузере: {exc}") from exc
+        raise
 
 
 def scrape_product(url: str, timeout: float = 15.0, use_browser: bool = True) -> ScrapedProduct:

@@ -27,6 +27,8 @@ class Recorder:
         self.calls.append((endpoint, data))
         if endpoint == "getMe":
             return BOT_USER
+        if endpoint == "getFile":
+            return {"file_id": "f", "file_unique_id": "u", "file_size": 10, "file_path": "photos/f.jpg"}
         if endpoint in ("sendMessage", "sendDocument", "editMessageText", "editMessageReplyMarkup"):
             return {
                 "message_id": len(self.calls) + 1000,
@@ -113,5 +115,19 @@ def callback_update(data: str, user_id: int = 1, update_id: int = 1) -> dict[str
                 "from": BOT_USER,
                 "text": "сообщение бота",
             },
+        },
+    }
+
+
+def photo_update(user_id: int = 1, update_id: int = 1) -> dict[str, Any]:
+    """Пользователь прислал фото (скриншот)."""
+    return {
+        "update_id": update_id,
+        "message": {
+            "message_id": update_id,
+            "date": 0,
+            "chat": {"id": user_id, "type": "private"},
+            "from": {"id": user_id, "is_bot": False, "first_name": "Тест"},
+            "photo": [{"file_id": "f", "file_unique_id": "u", "width": 800, "height": 1600, "file_size": 10}],
         },
     }

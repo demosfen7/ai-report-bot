@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from bot_harness import OWNER, callback_update, make_app, message_update, run_updates
+from bot_harness import OWNER, callback_update, make_app, message_update, photo_update, run_updates
+from telegram import File
 
 import bot
 from utils.ai_processor import OffTopicError
@@ -143,3 +144,66 @@ def test_manual_product_with_skip_buttons(app, monkeypatch: pytest.MonkeyPatch) 
     assert raw_inputs == [{"title": "Чайник Bosch", "description": None, "price_and_currency": None, "features": []}]
     assert len(recorder.sent("sendDocument")) == 1
     assert _keyboard_callbacks(recorder.sent("sendDocument")[0]) == ["new_product"]
+
+
+def _screenshot_mocks(application: Any, monkeypatch: pytest.MonkeyPatch, calls: dict[str, int]) -> None:
+    async def fake_download(self: Any, *args: Any, **kwargs: Any) -> bytearray:
+        return bytearray(b"\xff\xd8 fake jpeg")
+
+    async def fake_vision(image: bytes, media_type: str = "image/jpeg") -> ProductCard:
+        calls["vision"] += 1
+        return ProductCard(
+            product_name="Умный выключатель с Алисой", short_description="Wi-Fi выключатель без нуля.",
+            price=1290, currency="RUB", key_features=["Wi-Fi", "Без нуля"], image_url=None, source_url=None,
+        )
+
+    async def fake_card(raw: dict[str, Any]) -> ProductCard:
+        calls["text_llm"] += 1
+        raise AssertionError("по скриншоту текстовая нормализация не нужна")
+
+    monkeypatch.setattr(File, "download_as_bytearray", fake_download)
+    monkeypatch.setattr(application.bot_data["ai"], "generate_product_card_from_screenshot", fake_vision)
+    monkeypatch.setattr(application.bot_data["ai"], "generate_product_card", fake_card)
+
+
+def test_blocked_site_then_screenshot(app, monkeypatch: pytest.MonkeyPatch) -> None:
+    application, recorder = app
+    calls = {"vision": 0, "text_llm": 0}
+    _screenshot_mocks(application, monkeypatch, calls)
+
+    def blocked(url: str, timeout: float) -> None:
+        raise ScrapingError("blocked", "HTTP 403")
+
+    monkeypatch.setattr(bot, "ensure_public_host", lambda url: None)
+    monkeypatch.setattr(bot, "scrape_product_static", blocked)
+    application.bot_data["browser_enabled"] = False
+    run_updates(
+        application,
+        _activate(),
+        message_update(BTN_PRODUCT, update_id=2),
+        message_update("https://www.ozon.ru/product/vyklyuchatel-5920501078/", update_id=3),
+        photo_update(update_id=4),
+        callback_update(CB_SKIP, update_id=5),
+    )
+    texts = recorder.texts()
+    assert any("Пришлите скриншот страницы товара" in t for t in texts)
+    assert any("антибот" in t for t in texts)
+    assert calls == {"vision": 1, "text_llm": 0}
+    documents = recorder.sent("sendDocument")
+    assert len(documents) == 1
+    assert "Умный выключатель с Алисой" in documents[0]["caption"]
+
+
+def test_screenshot_instead_of_url(app, monkeypatch: pytest.MonkeyPatch) -> None:
+    application, recorder = app
+    calls = {"vision": 0, "text_llm": 0}
+    _screenshot_mocks(application, monkeypatch, calls)
+    run_updates(
+        application,
+        _activate(),
+        message_update(BTN_PRODUCT, update_id=2),
+        photo_update(update_id=3),
+        callback_update(CB_SKIP, update_id=4),
+    )
+    assert calls["vision"] == 1
+    assert len(recorder.sent("sendDocument")) == 1

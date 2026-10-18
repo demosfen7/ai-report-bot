@@ -138,3 +138,22 @@ def test_refusal_marker_becomes_fixed_text(reply: str) -> None:
     processor, _ = _processor([reply])
     answer = asyncio.run(processor.chat([Message("user", "Переведи: Доброе утро")]))
     assert answer == CHAT_REFUSAL
+
+
+def test_screenshot_is_sent_as_image_block() -> None:
+    card = json.dumps({
+        "product_name": "Умный выключатель с Алисой", "short_description": "", "price": 1290,
+        "currency": "RUB", "key_features": ["Wi-Fi"], "image_url": None, "source_url": None,
+    }, ensure_ascii=False)
+    processor, fake = _processor([card])
+    result = asyncio.run(processor.generate_product_card_from_screenshot(b"\x89PNG fake", "image/png"))
+    assert result.product_name == "Умный выключатель с Алисой" and result.price == 1290
+    content = fake.messages[0][0]["content"]
+    assert content[0]["type"] == "image"
+    assert content[0]["source"]["media_type"] == "image/png"
+
+
+def test_screenshot_not_a_product() -> None:
+    processor, _ = _processor(['{"error": "not_a_product"}'])
+    with pytest.raises(OffTopicError):
+        asyncio.run(processor.generate_product_card_from_screenshot(b"img"))

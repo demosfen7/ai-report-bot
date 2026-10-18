@@ -130,7 +130,7 @@ class PDFGenerator:
         self,
         card: ProductCard,
         image_src: str | None = None,
-        manual_entry: bool = False,
+        origin: str = "page",
         generated_at: datetime | None = None,
     ) -> Path:
         """Создать PDF «Карточка товара».
@@ -138,7 +138,8 @@ class PDFGenerator:
         Args:
             card: данные карточки.
             image_src: фото как data URI; None — будет placeholder.
-            manual_entry: данные введены вручную (влияет на подпись источника).
+            origin: откуда данные — `page` (страница сайта), `manual` (ввод вручную)
+                или `screenshot` (скриншот страницы); влияет на подпись источника.
             generated_at: время генерации, по умолчанию сейчас.
         """
         output_path = build_output_path(self._output_dir, "product", ".pdf")
@@ -146,7 +147,7 @@ class PDFGenerator:
         context = self._base_context(generated_at, document_id) | {
             "card": card,
             "image_src": image_src,
-            "manual_entry": manual_entry,
+            "origin": origin,
         }
         html = self.render_html(PRODUCT_TEMPLATE, context)
         return self.html_to_pdf(html, output_path)

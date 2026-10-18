@@ -232,7 +232,7 @@
       Ссылка на источник не указана
       {% endif %}
       <div class="origin">
-        {% if manual_entry %}Данные введены пользователем вручную и нормализованы AI.{% else %}Данные получены со страницы {{ card.source_url | domain }} и нормализованы AI.{% endif %}
+        {% if origin == "manual" %}Данные введены пользователем вручную и нормализованы AI.{% elif origin == "screenshot" %}Данные распознаны AI со скриншота страницы товара.{% else %}Данные получены со страницы {{ card.source_url | domain }} и нормализованы AI.{% endif %}
       </div>
     </div>
   </section>

@@ -75,6 +75,12 @@ from utils.rate_limit import RateLimiter, format_wait
 from utils.short_memory import ShortMemory
 from utils.validators import ClientReport, ProductCard, clean_text_list, normalize_url, save_model_json
 
+ORIGIN_REQUEST = {
+    "page": "/product — карточка товара по ссылке {url}",
+    "manual": "/product — карточка товара, данные введены вручную",
+    "screenshot": "/product — карточка товара по скриншоту страницы {url}",
+}
+
 logger = logging.getLogger("ai_report_bot")
 
 # Состояния ConversationHandler
@@ -91,6 +97,10 @@ logger = logging.getLogger("ai_report_bot")
 MIN_DIALOG_CHARS = 50
 MAX_DIALOG_CHARS = 100_000
 MAX_TXT_FILE_BYTES = 1_000_000
+# Anthropic принимает картинки до 5 МБ.
+MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024
+SCREENSHOT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+SCREENSHOT = filters.PHOTO | filters.Document.IMAGE
 SKIP_WORDS = {"пропустить", "пропуск", "skip", "-", "—", "нет"}
 # Сколько символов исходного диалога запоминать для вопросов после /report.
 MEMORY_DIALOG_CHARS = 8000
@@ -649,7 +659,10 @@ async def product_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     context.user_data.clear()
     logger.info("/product: старт сценария (чат %s)", update.effective_chat.id)
     await update.effective_message.reply_text(
-        "Отправьте ссылку на товар, и я создам карточку в PDF.", reply_markup=MAIN_MENU
+        "Отправьте ссылку на товар, и я создам карточку в PDF.\n\n"
+        "Если магазин защищён от автоматического чтения (Ozon, Wildberries и т.п.), "
+        "пришлите сразу скриншот страницы товара — я распознаю его сам.",
+        reply_markup=MAIN_MENU
     )
     return PRODUCT_WAIT_URL
 
@@ -672,6 +685,7 @@ async def product_receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not await _check_limit(update, context, "pdf"):
         context.user_data.clear()
         return ConversationHandler.END
+    context.user_data["pdf_counted"] = True
     status = await message.reply_text("Загружаю страницу товара…")
     try:
         scraped: ScrapedProduct = await _scrape(url, status, context)
@@ -694,7 +708,7 @@ async def product_receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE
         image_url=scraped.image_url,
         image_bytes=None,
         source_url=scraped.source_url,
-        manual_entry=False,
+        origin="page",
     )
     return ConversationHandler.END
 
@@ -720,12 +734,93 @@ async def _start_manual_mode(
     context.user_data["manual"] = {"source_url": url}
     logger.info("/product: переход в ручной режим (причина: %s)", reason)
     await message.reply_text(
-        "Не удалось автоматически получить данные с сайта. Давайте заполним карточку вручную.\n"
-        f"Причина: {reason}.\n\n"
-        f"Передумали — нажмите «{BTN_CANCEL}»."
+        f"Не удалось автоматически получить данные с сайта: {reason}.\n\n"
+        "Есть два способа сделать карточку:\n"
+        "📸 <b>Пришлите скриншот страницы товара</b> — я сам распознаю название, цену "
+        "и характеристики.\n"
+        "✍️ Или <b>введите название товара</b> — заполним карточку по шагам.\n\n"
+        f"Передумали — нажмите «{BTN_CANCEL}».",
+        parse_mode=ParseMode.HTML,
     )
-    await message.reply_text("Введите название товара:")
     return MANUAL_NAME
+
+
+async def product_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Скриншот вместо ссылки: сразу распознать товар."""
+    return await _product_from_screenshot(update, context, retry_state=PRODUCT_WAIT_URL)
+
+
+async def manual_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Скриншот в ручном режиме, когда сайт не отдал страницу."""
+    return await _product_from_screenshot(update, context, retry_state=MANUAL_NAME)
+
+
+async def _read_screenshot(message: Message) -> tuple[bytes, str] | None:
+    """Скачать скриншот из сообщения (фото или картинка файлом)."""
+    if message.photo:
+        telegram_file = await message.photo[-1].get_file()
+        return bytes(await telegram_file.download_as_bytearray()), "image/jpeg"
+    document = message.document
+    if document is None or document.mime_type not in SCREENSHOT_TYPES:
+        await message.reply_text("Пришлите скриншот как фото или картинку в формате JPG/PNG.")
+        return None
+    if document.file_size and document.file_size > MAX_SCREENSHOT_BYTES:
+        await message.reply_text("Файл больше 5 МБ. Пришлите скриншот как фото — Telegram его сожмёт.")
+        return None
+    telegram_file = await document.get_file()
+    return bytes(await telegram_file.download_as_bytearray()), document.mime_type
+
+
+async def _product_from_screenshot(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, retry_state: int
+) -> int:
+    """Распознать карточку по скриншоту и перейти к шагу с фото товара."""
+    message = update.effective_message
+    # Первая попытка в сценарии входит в лимит PDF, повторные — в лимит сообщений.
+    kind = "chat" if context.user_data.get("pdf_counted") else "pdf"
+    if not await _check_limit(update, context, kind):
+        return retry_state
+    context.user_data["pdf_counted"] = True
+
+    screenshot = await _read_screenshot(message)
+    if screenshot is None:
+        return retry_state
+    image, media_type = screenshot
+    manual: dict[str, Any] = context.user_data.setdefault("manual", {"source_url": None})
+    logger.info("/product: скриншот получен (%d КБ)", len(image) // 1024)
+
+    status = await message.chat.send_message("📸 Распознаю скриншот…")
+    await message.chat.send_action(ChatAction.TYPING)
+    try:
+        card = await _ai(context).generate_product_card_from_screenshot(image, media_type)
+    except OffTopicError:
+        await _set_status(
+            status,
+            "Не вижу на скриншоте страницу товара. Пришлите скриншот, где видны название и цена, "
+            "или введите название товара текстом.",
+        )
+        return retry_state
+    except AIProcessingError as exc:
+        logger.error("/product: ошибка распознавания скриншота: %s", exc.detail or exc.user_message)
+        await _set_status(status, f"{exc.user_message}\n\nПопробовать снова: «{BTN_PRODUCT}».")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    context.user_data["card"] = card
+    features = f"\nХарактеристик: {len(card.key_features)}" if card.key_features else ""
+    await _set_status(
+        status,
+        f"Распознал: {card.product_name}\nЦена: {format_price(card.price, card.currency)}{features}",
+    )
+    await message.chat.send_message(
+        "Пришлите фото товара для карточки — например, вырежьте его со скриншота. "
+        "Или пропустите: карточка будет без фото.",
+        reply_markup=skip_keyboard(),
+    )
+    logger.info("/product: скриншот распознан: %s", card.product_name[:80])
+    context.user_data["origin"] = "screenshot"
+    manual.setdefault("title", card.product_name)
+    return MANUAL_IMAGE
 
 
 async def manual_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -796,7 +891,10 @@ async def manual_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 )
                 return MANUAL_IMAGE
 
-    status = await message.chat.send_message("Нормализую данные и формирую карточку…")
+    ready_card: ProductCard | None = context.user_data.get("card")
+    status = await message.chat.send_message(
+        "Формирую карточку…" if ready_card else "Нормализую данные и формирую карточку…"
+    )
     await _build_and_send_product(
         message, context, status,
         user_id=update.effective_user.id,
@@ -804,7 +902,8 @@ async def manual_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         image_url=image_url,
         image_bytes=image_bytes,
         source_url=manual.get("source_url"),
-        manual_entry=True,
+        origin=context.user_data.get("origin", "manual"),
+        ready_card=ready_card,
     )
     return ConversationHandler.END
 
@@ -819,12 +918,16 @@ async def _build_and_send_product(
     image_url: str | None,
     image_bytes: bytes | None,
     source_url: str | None,
-    manual_entry: bool,
+    origin: str,
+    ready_card: ProductCard | None = None,
 ) -> None:
-    """Общий финал /product: Claude → JSON → фото → PDF → отправка."""
+    """Общий финал /product: Claude → JSON → фото → PDF → отправка.
+
+    Если карточка уже распознана (по скриншоту), повторно модель не вызывается.
+    """
     try:
         await message.chat.send_action(ChatAction.TYPING)
-        card = await _ai(context).generate_product_card(raw_data)
+        card = ready_card or await _ai(context).generate_product_card(raw_data)
         # Ссылки берём из исходных данных, а не из ответа модели: так она не сможет их исказить.
         card = card.model_copy(update={"image_url": image_url, "source_url": source_url})
         await asyncio.to_thread(save_model_json, card, config.JSON_DIR, "product")
@@ -838,16 +941,10 @@ async def _build_and_send_product(
         image_failed = bool(image_url or image_bytes) and image_src is None
 
         await _set_status(status, "Формирую PDF…")
-        pdf_path = await asyncio.to_thread(
-            _pdf(context).generate_product_pdf, card, image_src, manual_entry
-        )
+        pdf_path = await asyncio.to_thread(_pdf(context).generate_product_pdf, card, image_src, origin)
         await _send_pdf(message, pdf_path, _product_caption(card, image_failed), after_product_keyboard())
         await _delete_quietly(status)
-        request = (
-            "/product — карточка товара, данные введены вручную"
-            if manual_entry
-            else f"/product — карточка товара по ссылке {source_url}"
-        )
+        request = ORIGIN_REQUEST[origin].format(url=source_url or "").strip()
         await _remember_document(
             context,
             user_id,
@@ -1013,8 +1110,14 @@ def build_application(settings: config.Settings) -> Application:
                 REPORT_WAIT_TEXT: [
                     MessageHandler(TEXT_INPUT | filters.Document.FileExtension("txt"), report_receive_text),
                 ],
-                PRODUCT_WAIT_URL: [MessageHandler(TEXT_INPUT, product_receive_url)],
-                MANUAL_NAME: [MessageHandler(TEXT_INPUT, manual_name)],
+                PRODUCT_WAIT_URL: [
+                    MessageHandler(TEXT_INPUT, product_receive_url),
+                    MessageHandler(SCREENSHOT, product_screenshot),
+                ],
+                MANUAL_NAME: [
+                    MessageHandler(TEXT_INPUT, manual_name),
+                    MessageHandler(SCREENSHOT, manual_screenshot),
+                ],
                 MANUAL_DESCRIPTION: [MessageHandler(TEXT_INPUT, manual_description), _skip_button(manual_description)],
                 MANUAL_PRICE: [MessageHandler(TEXT_INPUT, manual_price), _skip_button(manual_price)],
                 MANUAL_FEATURES: [MessageHandler(TEXT_INPUT, manual_features), _skip_button(manual_features)],

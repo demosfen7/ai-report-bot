@@ -124,3 +124,12 @@ def test_unavailable_browser_keeps_original_reason(monkeypatch: pytest.MonkeyPat
     with pytest.raises(ScrapingError) as info:
         scraper.scrape_with_browser_fallback("https://shop.test/p/1", original)
     assert info.value.reason == "captcha"
+
+
+def test_browser_403_challenge_is_reported_as_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
+    challenge = "<html><head><title>Доступ ограничен</title></head><body><h1>Доступ ограничен</h1></body></html>"
+    monkeypatch.setattr(scraper, "render_page_with_browser", lambda url, timeout: (challenge, url, 403))
+    with pytest.raises(ScrapingError) as info:
+        scraper.scrape_product_browser("https://www.ozon.ru/product/1", 30)
+    assert info.value.reason == "blocked"
+    assert "антибот" in info.value.hint

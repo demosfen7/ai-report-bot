@@ -101,12 +101,12 @@ def test_product_pdf_with_image(generator: PDFGenerator, card: ProductCard) -> N
 def test_product_pdf_without_image_uses_placeholder(generator: PDFGenerator, card: ProductCard) -> None:
     html = generator.render_html(
         "product_card_template.html",
-        {"card": card, "image_src": None, "manual_entry": True,
+        {"card": card, "image_src": None, "origin": "manual",
          "generated_at": "", "generated_at_long": "", "document_id": "X"},
     )
     assert "Фото товара не предоставлено" in html
     assert "<img" not in html
-    _assert_pdf(generator.generate_product_pdf(card, image_src=None, manual_entry=True))
+    _assert_pdf(generator.generate_product_pdf(card, image_src=None, origin="manual"))
 
 
 def test_product_pdf_minimal_data(generator: PDFGenerator, card: ProductCard) -> None:
